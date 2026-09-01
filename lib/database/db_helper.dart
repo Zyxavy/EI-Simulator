@@ -17,7 +17,12 @@ class DbHelper {
   Future<Database> _initDB(String filePath) async {
     final dbPath = await getDatabasesPath();
     final path = join(dbPath, filePath);
-    return await openDatabase(path, version: 1, onCreate: _createDB);
+   return await openDatabase(
+      path,
+      version: 1,
+      onConfigure: (db) async => await db.execute('PRAGMA foreign_keys = ON'),
+      onCreate: _createDB,
+    );
   }
 
   Future<void> _createDB(Database db, int version) async {
