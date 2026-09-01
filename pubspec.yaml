@@ -1,5 +1,5 @@
 name: ei_simulator
-description: "A new Flutter project."
+description: "Obsidian-style love triangle node graph app."
 publish_to: 'none'
 version: 0.1.0+1
 
@@ -9,7 +9,6 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  
   sqflite: ^2.4.3
   path: ^1.9.1
   graphview: ^1.5.1
@@ -24,3 +23,5 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/images/

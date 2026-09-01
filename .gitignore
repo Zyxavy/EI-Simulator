@@ -12,6 +12,7 @@
 .swiftpm/
 migrate_working_dir/
 docs/TODOs.md
+docs/implementation-plan.md
 
 # IntelliJ related
 *.iml
