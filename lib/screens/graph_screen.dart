@@ -24,7 +24,6 @@ class _GraphScreenState extends State<GraphScreen> {
     FruchtermanReingoldConfiguration(),
   );
 
-  // Maps person ID → graphview Node
   final Map<int, Node> _nodeMap = {};
 
   void _buildGraph(List<Person> persons, List<Relationship> relationships) {
