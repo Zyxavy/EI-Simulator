@@ -1,6 +1,8 @@
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
-
+import '../models/person.dart';
+import '../models/relationship.dart';
+import '../models/relationship_image.dart';
 
 class DbHelper {
   static final DbHelper instance = DbHelper._init();
@@ -61,4 +63,212 @@ class DbHelper {
     ''');
   }
 
+  //PERSON CRUD
+  // CREATE
+  Future<int> insertPerson(Person person) async {
+    final db = await database;
+    return await db.insert('Person', person.toMap());
+  }
+
+  // READ ALL
+  Future<List<Person>> getAllPersons() async {
+    final db = await database;
+    final maps = await db.query('Person', orderBy: 'createdAt DESC');
+    return maps.map((m) => Person.fromMap(m)).toList();
+  }
+
+  // READ ONE
+  Future<Person?> getPersonById(int id) async {
+    final db = await database;
+    final maps = await db.query('Person', where: 'id = ?', whereArgs: [id]);
+    if (maps.isEmpty) return null;
+    return Person.fromMap(maps.first);
+  }
+
+  // UPDATE
+  Future<int> updatePerson(Person person) async {
+    final db = await database;
+    return await db.update(
+      'Person',
+      person.toMap(),
+      where: 'id = ?',
+      whereArgs: [person.id],
+    );
+  }
+
+  // DELETE
+  Future<int> deletePerson(int id) async {
+    final db = await database;
+    return await db.delete('Person', where: 'id = ?', whereArgs: [id]);
+  }
+
+  // SEARCH
+  Future<List<Person>> searchPersons(String query) async {
+    final db = await database;
+    final maps = await db.query(
+      'Person',
+      where: 'name LIKE ? OR personality LIKE ?',
+      whereArgs: ['%$query%', '%$query%'],
+    );
+    return maps.map((m) => Person.fromMap(m)).toList();
+  }
+
+  //RELATIONSHIP CRUD
+  // INSERT
+  Future<int> insertRelationship(Relationship relationship) async {
+    final db = await database;
+
+    // Check if reverse already exists 
+    final reverse = await db.query(
+      'Relationship',
+      where: 'fromPersonId = ? AND toPersonId = ?',
+      whereArgs: [relationship.toPersonId, relationship.fromPersonId],
+    );
+
+    if (reverse.isNotEmpty) {
+      final reverseId = reverse.first['id'] as int;
+      await db.update(
+        'Relationship',
+        {'isMutual': 1},
+        where: 'id = ?',
+        whereArgs: [reverseId],
+      );
+      return reverseId;
+    }
+
+    return await db.insert('Relationship', relationship.toMap());
+  }
+
+  // READ ALL
+  Future<List<Relationship>> getAllRelationships() async {
+    final db = await database;
+    final maps = await db.query('Relationship');
+    return maps.map((m) => Relationship.fromMap(m)).toList();
+  }
+
+  // READ BY PERSON 
+  Future<List<Relationship>> getRelationshipsByPersonId(int personId) async {
+    final db = await database;
+    final maps = await db.query(
+      'Relationship',
+      where: 'fromPersonId = ? OR toPersonId = ?',
+      whereArgs: [personId, personId],
+    );
+    return maps.map((m) => Relationship.fromMap(m)).toList();
+  }
+
+  // UPDATE
+  Future<int> updateRelationship(Relationship relationship) async {
+    final db = await database;
+    return await db.update(
+      'Relationship',
+      relationship.toMap(),
+      where: 'id = ?',
+      whereArgs: [relationship.id],
+    );
+  }
+
+  // SET MUTUAL
+  Future<void> setMutual(int id, bool isMutual) async {
+    final db = await database;
+    await db.update(
+      'Relationship',
+      {'isMutual': isMutual ? 1 : 0},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  // DELETE
+  Future<int> deleteRelationship(int id) async {
+    final db = await database;
+    return await db.delete('Relationship', where: 'id = ?', whereArgs: [id]);
+  }
+
+  //RELATIONSHIP IMAGE CRUD
+  Future<int> insertRelationshipImage(RelationshipImage image) async {
+    final db = await database;
+    return await db.insert('RelationshipImage', image.toMap());
+  }
+
+  Future<List<RelationshipImage>> getImagesByRelationshipId(int relationshipId) async {
+    final db = await database;
+    final maps = await db.query(
+      'RelationshipImage',
+      where: 'relationshipId = ?',
+      whereArgs: [relationshipId],
+    );
+    return maps.map((m) => RelationshipImage.fromMap(m)).toList();
+  }
+
+  Future<int> deleteRelationshipImage(int id) async {
+    final db = await database;
+    return await db.delete('RelationshipImage', where: 'id = ?', whereArgs: [id]);
+  }
+
+  //SEED DATA
+  Future<void> seedDatabase() async {
+    final db = await database;
+
+    // Gate: only seed once
+    final existing = await db.query('Person');
+    if (existing.isNotEmpty) return;
+
+    final now = DateTime.now().toIso8601String();
+
+    // Insert persons 
+    final id1 = await db.insert('Person', {
+      'name': 'John Reyes',
+      'description': 'A 3rd year CS student who spends more time debugging his love life than his code.',
+      'personality': 'Tsundere, Overconfident, Secretly Soft',
+      'imagePath': 'assets/images/john.png',
+      'createdAt': now,
+    });
+
+    final id2 = await db.insert('Person', {
+      'name': 'Maya Santos',
+      'description': 'Appears completely unbothered but has a Notion board tracking everyone\'s relationship status.',
+      'personality': 'Calculated, Charming, Chaotic Neutral',
+      'imagePath': 'assets/images/maya.png',
+      'createdAt': now,
+    });
+
+    final id3 = await db.insert('Person', {
+      'name': 'Carlos Delos Reyes',
+      'description': 'Main character energy. Unfortunately he is not the main character.',
+      'personality': 'Delusional, Loyal, Oblivious',
+      'imagePath': 'assets/images/carlos.png',
+      'createdAt': now,
+    });
+
+    // Insert relationships
+    final r1 = await db.insert('Relationship', {
+      'fromPersonId': id1,
+      'toPersonId': id2,
+      'label': 'Situationship',
+      'isMutual': 0,
+      'createdAt': now,
+    });
+
+    final r2 = await db.insert('Relationship', {
+      'fromPersonId': id2,
+      'toPersonId': id3,
+      'label': 'Crush',
+      'isMutual': 1,
+      'createdAt': now,
+    });
+
+    final r3 = await db.insert('Relationship', {
+      'fromPersonId': id3,
+      'toPersonId': id1,
+      'label': 'Ex',
+      'isMutual': 0,
+      'createdAt': now,
+    });
+
+    await db.insert('RelationshipImage', {'relationshipId': r1, 'imagePath': 'assets/images/john_maya_1.png'});
+    await db.insert('RelationshipImage', {'relationshipId': r1, 'imagePath': 'assets/images/john_maya_2.png'});
+    await db.insert('RelationshipImage', {'relationshipId': r2, 'imagePath': 'assets/images/maya_carlos_1.png'});
+    await db.insert('RelationshipImage', {'relationshipId': r3, 'imagePath': 'assets/images/carlos_john_1.png'});
+  }
 }
