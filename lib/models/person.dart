@@ -54,5 +54,4 @@ class Person {
       createdAt: createdAt ?? this.createdAt,
     );
   }
-
 }

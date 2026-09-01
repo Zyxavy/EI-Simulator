@@ -1,17 +1,20 @@
 import 'package:ei_simulator/database/db_helper.dart';
 import 'package:ei_simulator/providers/person_provider.dart';
+import 'package:ei_simulator/screens/add_edit_person_screen.dart';
+import 'package:ei_simulator/screens/graph_screen.dart';
+import 'package:ei_simulator/screens/search_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
-void main() async{
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await DbHelper.instance.seedDatabase();
   runApp(
-  ChangeNotifierProvider(
-    create: (_) => PersonProvider()..loadAll(),
-    child: const MainApp(),
-  ),
-);
+    ChangeNotifierProvider(
+      create: (_) => PersonProvider()..loadAll(),
+      child: const MainApp(),
+    ),
+  );
 }
 
 class MainApp extends StatelessWidget {
@@ -19,8 +22,14 @@ class MainApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const MaterialApp(
-      home: Scaffold(body: Center(child: Text('Hello World!'))),
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      initialRoute: '/',
+      routes: {
+        '/': (context) => const GraphScreen(),
+        '/search': (context) => const SearchScreen(),
+        '/person/add': (context) => const AddEditPersonScreen(),
+      },
     );
   }
 }

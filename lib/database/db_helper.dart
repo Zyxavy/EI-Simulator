@@ -1,5 +1,6 @@
-import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
+import 'package:sqflite/sqflite.dart';
+
 import '../models/person.dart';
 import '../models/relationship.dart';
 import '../models/relationship_image.dart';
@@ -19,7 +20,7 @@ class DbHelper {
   Future<Database> _initDB(String filePath) async {
     final dbPath = await getDatabasesPath();
     final path = join(dbPath, filePath);
-   return await openDatabase(
+    return await openDatabase(
       path,
       version: 1,
       onConfigure: (db) async => await db.execute('PRAGMA foreign_keys = ON'),
@@ -118,7 +119,7 @@ class DbHelper {
   Future<int> insertRelationship(Relationship relationship) async {
     final db = await database;
 
-    // Check if reverse already exists 
+    // Check if reverse already exists
     final reverse = await db.query(
       'Relationship',
       where: 'fromPersonId = ? AND toPersonId = ?',
@@ -146,7 +147,7 @@ class DbHelper {
     return maps.map((m) => Relationship.fromMap(m)).toList();
   }
 
-  // READ BY PERSON 
+  // READ BY PERSON
   Future<List<Relationship>> getRelationshipsByPersonId(int personId) async {
     final db = await database;
     final maps = await db.query(
@@ -191,7 +192,9 @@ class DbHelper {
     return await db.insert('RelationshipImage', image.toMap());
   }
 
-  Future<List<RelationshipImage>> getImagesByRelationshipId(int relationshipId) async {
+  Future<List<RelationshipImage>> getImagesByRelationshipId(
+    int relationshipId,
+  ) async {
     final db = await database;
     final maps = await db.query(
       'RelationshipImage',
@@ -203,7 +206,11 @@ class DbHelper {
 
   Future<int> deleteRelationshipImage(int id) async {
     final db = await database;
-    return await db.delete('RelationshipImage', where: 'id = ?', whereArgs: [id]);
+    return await db.delete(
+      'RelationshipImage',
+      where: 'id = ?',
+      whereArgs: [id],
+    );
   }
 
   //SEED DATA
@@ -216,7 +223,7 @@ class DbHelper {
 
     final now = DateTime.now().toIso8601String();
 
-    // Insert persons 
+    // Insert persons
     final id1 = await db.insert('Person', {
       'name': 'John Reyes',
       'description': 'A 3rd year CS student who spends more time debugging his love life than his code.',
@@ -235,7 +242,8 @@ class DbHelper {
 
     final id3 = await db.insert('Person', {
       'name': 'Carlos Delos Reyes',
-      'description': 'Main character energy. Unfortunately he is not the main character.',
+      'description':
+          'Main character energy. Unfortunately he is not the main character.',
       'personality': 'Delusional, Loyal, Oblivious',
       'imagePath': 'assets/images/carlos.png',
       'createdAt': now,
@@ -266,9 +274,21 @@ class DbHelper {
       'createdAt': now,
     });
 
-    await db.insert('RelationshipImage', {'relationshipId': r1, 'imagePath': 'assets/images/john_maya_1.png'});
-    await db.insert('RelationshipImage', {'relationshipId': r1, 'imagePath': 'assets/images/john_maya_2.png'});
-    await db.insert('RelationshipImage', {'relationshipId': r2, 'imagePath': 'assets/images/maya_carlos_1.png'});
-    await db.insert('RelationshipImage', {'relationshipId': r3, 'imagePath': 'assets/images/carlos_john_1.png'});
+    await db.insert('RelationshipImage', {
+      'relationshipId': r1,
+      'imagePath': 'assets/images/john_maya_1.png',
+    });
+    await db.insert('RelationshipImage', {
+      'relationshipId': r1,
+      'imagePath': 'assets/images/john_maya_2.png',
+    });
+    await db.insert('RelationshipImage', {
+      'relationshipId': r2,
+      'imagePath': 'assets/images/maya_carlos_1.png',
+    });
+    await db.insert('RelationshipImage', {
+      'relationshipId': r3,
+      'imagePath': 'assets/images/carlos_john_1.png',
+    });
   }
 }

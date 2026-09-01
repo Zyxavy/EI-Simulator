@@ -10,11 +10,7 @@ class RelationshipImage {
   });
 
   Map<String, dynamic> toMap() {
-    return {
-      'id': id,
-      'relationshipId': relationshipId,
-      'imagePath': imagePath,
-    };
+    return {'id': id, 'relationshipId': relationshipId, 'imagePath': imagePath};
   }
 
   factory RelationshipImage.fromMap(Map<String, dynamic> map) {
