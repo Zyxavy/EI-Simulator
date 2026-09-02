@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -36,8 +37,11 @@ class _SearchSheetContentState extends State<_SearchSheetContent> {
   final TextEditingController _controller = TextEditingController();
   List<Person> _results = [];
   bool _hasSearched = false;
+  Timer? _debounce;
+  int _searchGen = 0;
 
   Future<void> _onChanged(String query) async {
+    _debounce?.cancel();
     if (query.trim().isEmpty) {
       setState(() {
         _results = [];
@@ -45,7 +49,31 @@ class _SearchSheetContentState extends State<_SearchSheetContent> {
       });
       return;
     }
-    final res = await DbHelper.instance.searchPersons(query);
+    // Debounce 300ms to avoid hammering DB on fast typing (was per-keystroke query)
+    final gen = ++_searchGen;
+    _debounce = Timer(const Duration(milliseconds: 300), () async {
+      final q = query.trim();
+      if (q.isEmpty) return;
+      final res = await DbHelper.instance.searchPersons(q);
+      if (!mounted || gen != _searchGen) return;
+      setState(() {
+        _results = res;
+        _hasSearched = true;
+      });
+    });
+  }
+
+  Future<void> _forceSearch() async {
+    _debounce?.cancel();
+    final q = _controller.text.trim();
+    if (q.isEmpty) {
+      setState(() {
+        _results = [];
+        _hasSearched = false;
+      });
+      return;
+    }
+    final res = await DbHelper.instance.searchPersons(q);
     if (!mounted) return;
     setState(() {
       _results = res;
@@ -55,6 +83,7 @@ class _SearchSheetContentState extends State<_SearchSheetContent> {
 
   @override
   void dispose() {
+    _debounce?.cancel();
     _controller.dispose();
     super.dispose();
   }
@@ -77,7 +106,6 @@ class _SearchSheetContentState extends State<_SearchSheetContent> {
             ),
           ),
           const SizedBox(height: 14),
-          // Search bar -- white rounded rectangle + red icon as in mock
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
             child: Row(
@@ -99,30 +127,26 @@ class _SearchSheetContentState extends State<_SearchSheetContent> {
                         hintStyle: TextStyle(color: Colors.black38, fontSize: 12),
                       ),
                       onChanged: _onChanged,
+                      onSubmitted: (_) => _forceSearch(),
                     ),
                   ),
                 ),
                 const SizedBox(width: 8),
                 GestureDetector(
-                  onTap: () => _onChanged(_controller.text),
+                  onTap: _forceSearch,
                   child: const Icon(Icons.search, color: Colors.white, size: 22),
                 ),
               ],
             ),
           ),
           const SizedBox(height: 14),
-          // Results – scrollable, driven by sheet controller when sheet expands
-          Expanded(
-            child: _buildBody(),
-          ),
+          Expanded(child: _buildBody()),
         ],
       ),
     );
   }
 
   Widget _buildBody() {
-    // Use NestedScroll: outer sheet controller + inner ListView
-    // Simpler: use SingleChildScrollView with same controller and inner ListView as Sliver
     if (!_hasSearched && _controller.text.isEmpty) {
       return ListView(
         controller: widget.scrollController,
@@ -155,14 +179,20 @@ class _SearchSheetContentState extends State<_SearchSheetContent> {
       controller: widget.scrollController,
       padding: const EdgeInsets.fromLTRB(12, 4, 12, 24),
       itemCount: _results.length,
+      addRepaintBoundaries: true,
+      addAutomaticKeepAlives: false,
       itemBuilder: (context, i) {
         final p = _results[i];
         final isAsset = p.imagePath.startsWith('assets/');
+        ImageProvider bg;
+        if (isAsset) {
+          bg = AssetImage(p.imagePath);
+        } else {
+          // Use resized decode at avatar size to avoid full-res decode jank
+          bg = ResizeImage(FileImage(File(p.imagePath)), width: 64, height: 64);
+        }
         return GestureDetector(
-          onTap: () {
-            // Exit sheet first, then present profile (per request)
-            Navigator.pop(context, p);
-          },
+          onTap: () => Navigator.pop(context, p),
           child: Container(
             margin: const EdgeInsets.only(bottom: 8),
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
@@ -174,18 +204,13 @@ class _SearchSheetContentState extends State<_SearchSheetContent> {
               children: [
                 CircleAvatar(
                   radius: 16,
-                  backgroundImage: isAsset
-                      ? AssetImage(p.imagePath)
-                      : FileImage(File(p.imagePath)) as ImageProvider,
+                  backgroundImage: bg,
                   backgroundColor: Colors.white,
                   onBackgroundImageError: (_, _) {},
                 ),
                 const SizedBox(width: 10),
                 Expanded(
-                  child: Text(
-                    p.name,
-                    style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 13),
-                  ),
+                  child: Text(p.name, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 13)),
                 ),
                 const Icon(Icons.chevron_right, color: Colors.white70, size: 18),
               ],

@@ -13,8 +13,13 @@ class PersonProvider extends ChangeNotifier {
 
   Future<void> loadAll() async {
     try {
-      _persons = await DbHelper.instance.getAllPersons();
-      _relationships = await DbHelper.instance.getAllRelationships();
+      // Parallelize independent queries — was sequential, blocking twice as long
+      final results = await Future.wait([
+        DbHelper.instance.getAllPersons(),
+        DbHelper.instance.getAllRelationships(),
+      ]);
+      _persons = results[0] as List<Person>;
+      _relationships = results[1] as List<Relationship>;
     } catch (e, stack) {
       debugPrint('PersonProvider.loadAll error: $e');
       debugPrint('$stack');

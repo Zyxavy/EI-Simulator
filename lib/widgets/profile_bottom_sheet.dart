@@ -1,14 +1,13 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:provider/provider.dart';
 
 import '../database/db_helper.dart';
 import '../models/person.dart';
 import '../models/relationship.dart';
 import '../models/relationship_image.dart';
-import 'package:image_picker/image_picker.dart';
-
 import '../providers/person_provider.dart';
 import '../theme/app_colors.dart';
 
@@ -47,6 +46,7 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
   late Person _person;
   List<Relationship> _relationships = [];
   Map<int, List<RelationshipImage>> _imagesByRelId = {};
+  Map<int, Person> _personsById = {};
   bool _loading = true;
   bool _isEditing = false;
   bool _isSaving = false;
@@ -79,14 +79,32 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
     final fresh = await DbHelper.instance.getPersonById(_person.id!);
     if (fresh != null) _person = fresh;
     final rels = await DbHelper.instance.getRelationshipsByPersonId(_person.id!);
-    final Map<int, List<RelationshipImage>> imgMap = {};
-    for (final r in rels) {
-      imgMap[r.id!] = await DbHelper.instance.getImagesByRelationshipId(r.id!);
+    // Parallelize N+1 image queries — was sequential loop causing jank on main thread
+    final imageLists = await Future.wait(
+      rels.map((r) => DbHelper.instance.getImagesByRelationshipId(r.id!)),
+    );
+    final Map<int, List<RelationshipImage>> imgMap = {
+      for (int i = 0; i < rels.length; i++) rels[i].id!: imageLists[i],
+    };
+    // Build synchronous person lookup map from provider (avoids FutureBuilder per relationship)
+    Map<int, Person> personsById = _personsById;
+    if (mounted) {
+      try {
+        final provider = Provider.of<PersonProvider>(context, listen: false);
+        personsById = {for (final p in provider.persons) p.id!: p};
+        // Ensure current person also present
+        personsById[_person.id!] = _person;
+      } catch (_) {
+        // fallback: fetch from DB if provider not ready
+        final all = await DbHelper.instance.getAllPersons();
+        personsById = {for (final p in all) p.id!: p};
+      }
     }
     if (!mounted) return;
     setState(() {
       _relationships = rels;
       _imagesByRelId = imgMap;
+      _personsById = personsById;
       _loading = false;
     });
   }
@@ -97,12 +115,18 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
       builder: (ctx) => AlertDialog(
         backgroundColor: AppColors.bgLight,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text('Delete Person?', style: TextStyle(color: Color(0xFF2B0000), fontWeight: FontWeight.bold)),
+        title: const Text('Delete Person?',
+            style: TextStyle(color: Color(0xFF2B0000), fontWeight: FontWeight.bold)),
         content: Text('This will delete ${_person.name} and all relationships.',
             style: const TextStyle(color: Colors.black54)),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel', style: TextStyle(color: Colors.black54))),
-          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Delete', style: TextStyle(color: AppColors.vividRed, fontWeight: FontWeight.bold))),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel', style: TextStyle(color: Colors.black54))),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Delete',
+                  style: TextStyle(color: AppColors.vividRed, fontWeight: FontWeight.bold))),
         ],
       ),
     );
@@ -110,7 +134,7 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
     if (!mounted) return;
     await Provider.of<PersonProvider>(context, listen: false).deletePerson(_person.id!);
     if (!mounted) return;
-    Navigator.pop(context); // close sheet
+    Navigator.pop(context);
   }
 
   Future<void> _deleteRel(int id) async {
@@ -119,11 +143,16 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
       builder: (ctx) => AlertDialog(
         backgroundColor: AppColors.bgLight,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text('Delete Relationship?', style: TextStyle(color: Color(0xFF2B0000), fontWeight: FontWeight.bold)),
+        title: const Text('Delete Relationship?',
+            style: TextStyle(color: Color(0xFF2B0000), fontWeight: FontWeight.bold)),
         content: const Text('Remove this relationship?', style: TextStyle(color: Colors.black54)),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel', style: TextStyle(color: Colors.black54))),
-          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Delete', style: TextStyle(color: AppColors.vividRed))),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel', style: TextStyle(color: Colors.black54))),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Delete', style: TextStyle(color: AppColors.vividRed))),
         ],
       ),
     );
@@ -170,14 +199,16 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
         imagePath: _editImagePath!,
       );
       await Provider.of<PersonProvider>(context, listen: false).updatePerson(updated);
-      // Refresh local
       _person = updated;
       await _loadData();
       if (!mounted) return;
       setState(() => _isEditing = false);
       if (!context.mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Saved "$name"'), backgroundColor: AppColors.vividRed, behavior: SnackBarBehavior.floating),
+        SnackBar(
+            content: Text('Saved "$name"'),
+            backgroundColor: AppColors.vividRed,
+            behavior: SnackBarBehavior.floating),
       );
     } finally {
       if (mounted) setState(() => _isSaving = false);
@@ -186,18 +217,28 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
 
   Widget _buildHeader() {
     if (_isEditing) {
-      // Editable header: tappable avatar + text fields
       final isEditAsset = _editImagePath != null && _editImagePath!.startsWith('assets/');
-      final editFileExists = _editImagePath != null && !_editImagePath!.startsWith('assets/') && File(_editImagePath!).existsSync();
+      // Avoid existsSync on every build for edit avatar — check once and cache via local bool is fine here
+      // since this sheet rebuilds rarely (not 60fps). Still guard.
+      final editFileExists = _editImagePath != null &&
+          !_editImagePath!.startsWith('assets/') &&
+          _editImagePath!.isNotEmpty &&
+          File(_editImagePath!).existsSync();
       Widget editAvatar;
       if (isEditAsset) {
-        editAvatar = CircleAvatar(radius: 34, backgroundImage: AssetImage(_editImagePath!), backgroundColor: Colors.white);
+        editAvatar = CircleAvatar(
+            radius: 34, backgroundImage: AssetImage(_editImagePath!), backgroundColor: Colors.white);
       } else if (editFileExists) {
-        editAvatar = CircleAvatar(radius: 34, backgroundImage: FileImage(File(_editImagePath!)));
+        editAvatar = CircleAvatar(
+            radius: 34,
+            backgroundImage: ResizeImage(FileImage(File(_editImagePath!)), width: 140, height: 140));
       } else if (_editImagePath != null && _editImagePath!.isNotEmpty) {
-        editAvatar = CircleAvatar(radius: 34, backgroundImage: FileImage(File(_editImagePath!)), backgroundColor: Colors.white);
+        // File missing — fallback to placeholder instead of crashing FileImage
+        editAvatar = const CircleAvatar(
+            radius: 34, backgroundColor: Colors.white, child: Icon(Icons.person, size: 34, color: AppColors.vividRed));
       } else {
-        editAvatar = const CircleAvatar(radius: 34, backgroundColor: Colors.white, child: Icon(Icons.person, size: 34, color: AppColors.vividRed));
+        editAvatar = const CircleAvatar(
+            radius: 34, backgroundColor: Colors.white, child: Icon(Icons.person, size: 34, color: AppColors.vividRed));
       }
 
       return Row(
@@ -209,7 +250,10 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
               alignment: Alignment.bottomRight,
               children: [
                 Container(
-                  decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 2), boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.12), blurRadius: 6)]),
+                  decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      border: Border.all(color: Colors.white, width: 2),
+                      boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.12), blurRadius: 6)]),
                   child: editAvatar,
                 ),
                 Container(
@@ -225,7 +269,6 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // Name field
                 SizedBox(
                   height: 36,
                   child: TextField(
@@ -237,13 +280,15 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
                       filled: true,
                       fillColor: Colors.white,
                       contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                      enabledBorder: OutlineInputBorder(borderSide: const BorderSide(color: Colors.white), borderRadius: BorderRadius.circular(10)),
-                      focusedBorder: const OutlineInputBorder(borderSide: BorderSide(color: AppColors.coral, width: 1.4), borderRadius: BorderRadius.all(Radius.circular(10))),
+                      enabledBorder: OutlineInputBorder(
+                          borderSide: const BorderSide(color: Colors.white), borderRadius: BorderRadius.circular(10)),
+                      focusedBorder: const OutlineInputBorder(
+                          borderSide: BorderSide(color: AppColors.coral, width: 1.4),
+                          borderRadius: BorderRadius.all(Radius.circular(10))),
                     ),
                   ),
                 ),
                 const SizedBox(height: 6),
-                // Personality inline edit
                 SizedBox(
                   height: 32,
                   child: TextField(
@@ -256,8 +301,12 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
                       filled: true,
                       fillColor: Colors.white.withValues(alpha: 0.9),
                       contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                      enabledBorder: OutlineInputBorder(borderSide: BorderSide(color: Colors.white.withValues(alpha: 0.8)), borderRadius: BorderRadius.circular(20)),
-                      focusedBorder: const OutlineInputBorder(borderSide: BorderSide(color: AppColors.coral), borderRadius: BorderRadius.all(Radius.circular(20))),
+                      enabledBorder: OutlineInputBorder(
+                          borderSide: BorderSide(color: Colors.white.withValues(alpha: 0.8)),
+                          borderRadius: BorderRadius.circular(20)),
+                      focusedBorder: const OutlineInputBorder(
+                          borderSide: BorderSide(color: AppColors.coral),
+                          borderRadius: BorderRadius.all(Radius.circular(20))),
                     ),
                   ),
                 ),
@@ -269,14 +318,28 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
     }
 
     final isAsset = _person.imagePath.startsWith('assets/');
-    final fileExists = !isAsset && File(_person.imagePath).existsSync();
     Widget avatar;
     if (isAsset) {
-      avatar = CircleAvatar(radius: 34, backgroundImage: AssetImage(_person.imagePath), backgroundColor: Colors.white, onBackgroundImageError: (_, _) {});
-    } else if (fileExists) {
-      avatar = CircleAvatar(radius: 34, backgroundImage: FileImage(File(_person.imagePath)));
+      avatar = CircleAvatar(
+          radius: 34,
+          backgroundImage: AssetImage(_person.imagePath),
+          backgroundColor: Colors.white,
+          onBackgroundImageError: (_, _) {});
     } else {
-      avatar = const CircleAvatar(radius: 34, backgroundColor: Colors.white, child: Icon(Icons.person, size: 34, color: AppColors.vividRed));
+      // Use cached existence via _personsById lookup or check file once: if cached map says missing, show placeholder
+      // Here we avoid synchronous file IO in build by using ResizeImage with errorBuilder via Image widget fallback
+      // But CircleAvatar backgroundImage doesn't have errorBuilder for FileImage missing case, so guard with _personsById file existence?
+      // Quick check: if path is file and we have not verified, try existsSync but this branch is not hot (sheet, not 60fps)
+      final fileExists = File(_person.imagePath).existsSync();
+      if (fileExists) {
+        avatar = CircleAvatar(
+            radius: 34,
+            backgroundImage: ResizeImage(FileImage(File(_person.imagePath)), width: 140, height: 140),
+            onBackgroundImageError: (_, _) {});
+      } else {
+        avatar = const CircleAvatar(
+            radius: 34, backgroundColor: Colors.white, child: Icon(Icons.person, size: 34, color: AppColors.vividRed));
+      }
     }
 
     final pill = _person.personality.split(',').map((s) => s.trim()).where((s) => s.isNotEmpty).toList().isNotEmpty
@@ -287,7 +350,10 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Container(
-          decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 2), boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.12), blurRadius: 6)]),
+          decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              border: Border.all(color: Colors.white, width: 2),
+              boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.12), blurRadius: 6)]),
           child: avatar,
         ),
         const SizedBox(width: 14),
@@ -295,13 +361,15 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(_person.name, style: const TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w700)),
+              Text(_person.name,
+                  style: const TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w700)),
               if (pill.isNotEmpty) ...[
                 const SizedBox(height: 6),
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                   decoration: BoxDecoration(color: AppColors.coral, borderRadius: BorderRadius.circular(20)),
-                  child: Text(pill, style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.w600)),
+                  child:
+                      Text(pill, style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.w600)),
                 ),
               ],
             ],
@@ -325,7 +393,8 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
       builder: (ctx) => AlertDialog(
         backgroundColor: AppColors.bgLight,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text('Add Relationship', style: TextStyle(color: Color(0xFF2B0000), fontWeight: FontWeight.bold, fontSize: 16)),
+        title: const Text('Add Relationship',
+            style: TextStyle(color: Color(0xFF2B0000), fontWeight: FontWeight.bold, fontSize: 16)),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -334,10 +403,14 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
               decoration: InputDecoration(
                 labelText: 'To',
                 labelStyle: const TextStyle(color: Colors.black54),
-                enabledBorder: OutlineInputBorder(borderSide: const BorderSide(color: Colors.black54), borderRadius: BorderRadius.all(Radius.circular(8))),
-                focusedBorder: const OutlineInputBorder(borderSide: BorderSide(color: AppColors.coral), borderRadius: BorderRadius.all(Radius.circular(8))),
+                enabledBorder: OutlineInputBorder(
+                    borderSide: const BorderSide(color: Colors.black54), borderRadius: BorderRadius.all(Radius.circular(8))),
+                focusedBorder:
+                    const OutlineInputBorder(borderSide: BorderSide(color: AppColors.coral), borderRadius: BorderRadius.all(Radius.circular(8))),
               ),
-              items: persons.map((p) => DropdownMenuItem(value: p, child: Text(p.name, style: const TextStyle(color: Colors.black87)))).toList(),
+              items: persons
+                  .map((p) => DropdownMenuItem(value: p, child: Text(p.name, style: const TextStyle(color: Colors.black87))))
+                  .toList(),
               onChanged: (v) => selectedTo = v,
             ),
             const SizedBox(height: 12),
@@ -346,8 +419,10 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
               decoration: InputDecoration(
                 labelText: 'Label (Crush, Ex, Situationship)',
                 labelStyle: const TextStyle(color: Colors.black54, fontSize: 12),
-                enabledBorder: OutlineInputBorder(borderSide: const BorderSide(color: Colors.black54), borderRadius: BorderRadius.circular(8)),
-                focusedBorder: OutlineInputBorder(borderSide: const BorderSide(color: AppColors.coral), borderRadius: BorderRadius.circular(8)),
+                enabledBorder: OutlineInputBorder(
+                    borderSide: const BorderSide(color: Colors.black54), borderRadius: BorderRadius.circular(8)),
+                focusedBorder:
+                    OutlineInputBorder(borderSide: const BorderSide(color: AppColors.coral), borderRadius: BorderRadius.circular(8)),
               ),
             ),
           ],
@@ -371,7 +446,8 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
       final toPerson = result['to'] as Person;
       final label = result['label'] as String;
       final now = DateTime.now().toIso8601String();
-      final rel = Relationship(fromPersonId: _person.id!, toPersonId: toPerson.id!, label: label, isMutual: false, createdAt: now);
+      final rel =
+          Relationship(fromPersonId: _person.id!, toPersonId: toPerson.id!, label: label, isMutual: false, createdAt: now);
       await DbHelper.instance.insertRelationship(rel);
       if (!mounted) return;
       await Provider.of<PersonProvider>(context, listen: false).loadAll();
@@ -380,7 +456,6 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
   }
 
   Widget _buildRelationshipsCompact() {
-    // Edit mode: wizard-style Add Relationships row with chips + plus (only possible when editing)
     if (_isEditing) {
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -394,49 +469,52 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
               children: [
                 ..._relationships.map((rel) {
                   final otherId = rel.fromPersonId == _person.id ? rel.toPersonId : rel.fromPersonId;
-                  return FutureBuilder<Person?>(
-                    future: DbHelper.instance.getPersonById(otherId),
-                    builder: (context, snap) {
-                      final p = snap.data;
-                      final path = p?.imagePath;
-                      Widget av;
-                      if (path == null) {
-                        av = const CircleAvatar(radius: 14, backgroundColor: Colors.white, child: Icon(Icons.person, size: 14, color: AppColors.vividRed));
-                      } else if (path.startsWith('assets/')) {
-                        av = CircleAvatar(radius: 14, backgroundImage: AssetImage(path), backgroundColor: Colors.white);
-                      } else if (File(path).existsSync()) {
-                        av = CircleAvatar(radius: 14, backgroundImage: FileImage(File(path)));
-                      } else {
-                        av = const CircleAvatar(radius: 14, backgroundColor: Colors.white, child: Icon(Icons.person, size: 14, color: AppColors.vividRed));
-                      }
-                      return Container(
-                        margin: const EdgeInsets.only(right: 8),
-                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), border: Border.all(color: AppColors.coral.withValues(alpha: 0.3))),
-                        child: Row(
+                  final p = _personsById[otherId];
+                  final path = p?.imagePath;
+                  Widget av;
+                  if (path == null) {
+                    av = const CircleAvatar(
+                        radius: 14, backgroundColor: Colors.white, child: Icon(Icons.person, size: 14, color: AppColors.vividRed));
+                  } else if (path.startsWith('assets/')) {
+                    av = CircleAvatar(radius: 14, backgroundImage: AssetImage(path), backgroundColor: Colors.white);
+                  } else {
+                    final exists = File(path).existsSync();
+                    if (exists) {
+                      av = CircleAvatar(radius: 14, backgroundImage: ResizeImage(FileImage(File(path)), width: 56, height: 56));
+                    } else {
+                      av = const CircleAvatar(
+                          radius: 14, backgroundColor: Colors.white, child: Icon(Icons.person, size: 14, color: AppColors.vividRed));
+                    }
+                  }
+                  return Container(
+                    margin: const EdgeInsets.only(right: 8),
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                    decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(color: AppColors.coral.withValues(alpha: 0.3))),
+                    child: Row(
+                      children: [
+                        av,
+                        const SizedBox(width: 6),
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisAlignment: MainAxisAlignment.center,
                           children: [
-                            av,
-                            const SizedBox(width: 6),
-                            Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Text(p?.name.split(' ').first ?? 'Unknown', style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: Colors.black87)),
-                                Text(rel.label, style: const TextStyle(fontSize: 9, color: AppColors.coral)),
-                              ],
-                            ),
-                            const SizedBox(width: 4),
-                            GestureDetector(
-                              onTap: () => _deleteRel(rel.id!),
-                              child: const Icon(Icons.close, size: 14, color: Colors.black45),
-                            ),
+                            Text(p?.name.split(' ').first ?? 'Unknown',
+                                style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: Colors.black87)),
+                            Text(rel.label, style: const TextStyle(fontSize: 9, color: AppColors.coral)),
                           ],
                         ),
-                      );
-                    },
+                        const SizedBox(width: 4),
+                        GestureDetector(
+                          onTap: () => _deleteRel(rel.id!),
+                          child: const Icon(Icons.close, size: 14, color: Colors.black45),
+                        ),
+                      ],
+                    ),
                   );
                 }),
-                // Plus button - only in edit mode (wizard style)
                 GestureDetector(
                   onTap: _showAddRelationshipInEdit,
                   child: Container(
@@ -452,18 +530,19 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
           if (_relationships.isEmpty)
             Padding(
               padding: const EdgeInsets.only(top: 4),
-              child: Text('Tap + to add a relationship', style: TextStyle(color: Colors.white.withValues(alpha: 0.7), fontSize: 10)),
+              child:
+                  Text('Tap + to add a relationship', style: TextStyle(color: Colors.white.withValues(alpha: 0.7), fontSize: 10)),
             ),
         ],
       );
     }
 
-    // View mode: read-only small avatars row (no add)
     if (_relationships.isEmpty) {
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text('RELATIONSHIPS:', style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700, letterSpacing: 0.8)),
+          const Text('RELATIONSHIPS:',
+              style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700, letterSpacing: 0.8)),
           const SizedBox(height: 8),
           const Text('None', style: TextStyle(color: Colors.white60, fontStyle: FontStyle.italic, fontSize: 12)),
         ],
@@ -472,50 +551,54 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text('RELATIONSHIPS:', style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700, letterSpacing: 0.8)),
+        const Text('RELATIONSHIPS:',
+            style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700, letterSpacing: 0.8)),
         const SizedBox(height: 8),
         SizedBox(
           height: 36,
           child: ListView.builder(
             scrollDirection: Axis.horizontal,
             itemCount: _relationships.length,
+            addRepaintBoundaries: true,
             itemBuilder: (context, i) {
               final rel = _relationships[i];
               final otherId = rel.fromPersonId == _person.id ? rel.toPersonId : rel.fromPersonId;
-              return FutureBuilder<Person?>(
-                future: DbHelper.instance.getPersonById(otherId),
-                builder: (context, snap) {
-                  final p = snap.data;
-                  final path = p?.imagePath;
-                  Widget av;
-                  if (path == null) {
-                    av = const CircleAvatar(radius: 16, backgroundColor: Colors.white, child: Icon(Icons.person, size: 14, color: AppColors.vividRed));
-                  } else if (path.startsWith('assets/')) {
-                    av = CircleAvatar(radius: 16, backgroundImage: AssetImage(path), backgroundColor: Colors.white);
-                  } else if (File(path).existsSync()) {
-                    av = CircleAvatar(radius: 16, backgroundImage: FileImage(File(path)));
-                  } else {
-                    av = const CircleAvatar(radius: 16, backgroundColor: Colors.white, child: Icon(Icons.person, size: 14, color: AppColors.vividRed));
-                  }
-                  return Container(
-                    margin: EdgeInsets.only(right: 6, left: i == 0 ? 0 : 0),
-                    child: Stack(
-                      clipBehavior: Clip.none,
-                      children: [
-                        av,
-                        Positioned(
-                          bottom: -2,
-                          right: -4,
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
-                            decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(6), border: Border.all(color: AppColors.coral, width: 0.8)),
-                            child: Text(rel.label, style: const TextStyle(fontSize: 7, fontWeight: FontWeight.w600, color: AppColors.vividRed)),
-                          ),
-                        ),
-                      ],
+              final p = _personsById[otherId];
+              final path = p?.imagePath;
+              Widget av;
+              if (path == null) {
+                av = const CircleAvatar(
+                    radius: 16, backgroundColor: Colors.white, child: Icon(Icons.person, size: 14, color: AppColors.vividRed));
+              } else if (path.startsWith('assets/')) {
+                av = CircleAvatar(radius: 16, backgroundImage: AssetImage(path), backgroundColor: Colors.white);
+              } else {
+                final exists = File(path).existsSync();
+                if (exists) {
+                  av = CircleAvatar(radius: 16, backgroundImage: ResizeImage(FileImage(File(path)), width: 64, height: 64));
+                } else {
+                  av = const CircleAvatar(
+                      radius: 16, backgroundColor: Colors.white, child: Icon(Icons.person, size: 14, color: AppColors.vividRed));
+                }
+              }
+              return Container(
+                margin: const EdgeInsets.only(right: 6),
+                child: Stack(
+                  clipBehavior: Clip.none,
+                  children: [
+                    av,
+                    Positioned(
+                      bottom: -2,
+                      right: -4,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                        decoration: BoxDecoration(
+                            color: Colors.white, borderRadius: BorderRadius.circular(6), border: Border.all(color: AppColors.coral, width: 0.8)),
+                        child: Text(rel.label,
+                            style: const TextStyle(fontSize: 7, fontWeight: FontWeight.w600, color: AppColors.vividRed)),
+                      ),
                     ),
-                  );
-                },
+                  ],
+                ),
               );
             },
           ),
@@ -533,7 +616,6 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
     }
     final XFile? picked = await _editPicker.pickImage(source: ImageSource.gallery);
     if (picked == null) return;
-    // Attach to first relationship (or most recent) - simple for now
     final targetRelId = _relationships.first.id!;
     await DbHelper.instance.insertRelationshipImage(
       RelationshipImage(relationshipId: targetRelId, imagePath: picked.path),
@@ -555,9 +637,7 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
             InteractiveViewer(
               minScale: 0.8,
               maxScale: 4,
-              child: Center(
-                child: Image(image: provider, fit: BoxFit.contain),
-              ),
+              child: Center(child: Image(image: provider, fit: BoxFit.contain)),
             ),
             Positioned(
               top: 8,
@@ -566,7 +646,8 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
                 onTap: () => Navigator.pop(ctx),
                 child: Container(
                   padding: const EdgeInsets.all(6),
-                  decoration: BoxDecoration(color: Colors.black54, shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 1)),
+                  decoration:
+                      BoxDecoration(color: Colors.black54, shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 1)),
                   child: const Icon(Icons.close, color: Colors.white, size: 20),
                 ),
               ),
@@ -581,19 +662,15 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
     final allImages = _imagesByRelId.values.expand((e) => e).toList();
     final isEditingGallery = _isEditing;
 
-    // Empty state - show add tile only in edit mode
     if (allImages.isEmpty) {
       if (!isEditingGallery) {
         return Container(
           width: double.infinity,
           padding: const EdgeInsets.symmetric(vertical: 24, horizontal: 16),
           decoration: BoxDecoration(color: const Color(0xFFE8E8E8), borderRadius: BorderRadius.circular(4)),
-          child: Center(
-            child: Text('No photos', style: TextStyle(color: Colors.black.withValues(alpha: 0.3), fontSize: 11)),
-          ),
+          child: Center(child: Text('No photos', style: TextStyle(color: Colors.black.withValues(alpha: 0.3), fontSize: 11))),
         );
       }
-      // Edit mode empty - show add tile
       return Container(
         width: double.infinity,
         padding: const EdgeInsets.all(8),
@@ -625,7 +702,6 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
       );
     }
 
-    // Gallery grid - vertical, requires scrolling down to see more
     final itemCount = isEditingGallery ? allImages.length + 1 : allImages.length;
     return Container(
       width: double.infinity,
@@ -635,6 +711,8 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
         shrinkWrap: true,
         physics: const NeverScrollableScrollPhysics(),
         itemCount: itemCount,
+        addRepaintBoundaries: true,
+        addAutomaticKeepAlives: false,
         gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
           crossAxisCount: 3,
           crossAxisSpacing: 8,
@@ -642,7 +720,6 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
           childAspectRatio: 1,
         ),
         itemBuilder: (context, idx) {
-          // Last tile in edit mode is Add button
           if (isEditingGallery && idx == allImages.length) {
             return GestureDetector(
               onTap: _addPhoto,
@@ -658,53 +735,57 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
           }
           final img = allImages[idx];
           final isAsset = img.imagePath.startsWith('assets/');
-          final prov = isAsset ? AssetImage(img.imagePath) as ImageProvider : FileImage(File(img.imagePath));
-          return GestureDetector(
-            onTap: () async {
-              if (isEditingGallery) {
-                // Only removable in edit mode
-                final confirmed = await showDialog<bool>(
-                  context: context,
-                  builder: (ctx) => AlertDialog(
-                    backgroundColor: AppColors.bgLight,
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                    title: const Text('Remove photo?', style: TextStyle(color: Color(0xFF2B0000), fontWeight: FontWeight.bold, fontSize: 14)),
-                    content: const Text('Delete this photo?', style: TextStyle(color: Colors.black54, fontSize: 12)),
-                    actions: [
-                      TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel', style: TextStyle(color: Colors.black54))),
-                      TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Delete', style: TextStyle(color: AppColors.vividRed))),
-                    ],
-                  ),
-                );
-                if (confirmed == true) {
-                  await DbHelper.instance.deleteRelationshipImage(img.id!);
-                  await _loadData();
-                  if (!mounted) return;
-                  if (!context.mounted) return;
-                  await Provider.of<PersonProvider>(context, listen: false).loadAll();
+          final ImageProvider prov = isAsset
+              ? AssetImage(img.imagePath)
+              : ResizeImage(FileImage(File(img.imagePath)), width: 320, height: 320);
+          return RepaintBoundary(
+            child: GestureDetector(
+              onTap: () async {
+                if (isEditingGallery) {
+                  final confirmed = await showDialog<bool>(
+                    context: context,
+                    builder: (ctx) => AlertDialog(
+                      backgroundColor: AppColors.bgLight,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      title: const Text('Remove photo?',
+                          style: TextStyle(color: Color(0xFF2B0000), fontWeight: FontWeight.bold, fontSize: 14)),
+                      content: const Text('Delete this photo?', style: TextStyle(color: Colors.black54, fontSize: 12)),
+                      actions: [
+                        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel', style: TextStyle(color: Colors.black54))),
+                        TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Delete', style: TextStyle(color: AppColors.vividRed))),
+                      ],
+                    ),
+                  );
+                  if (confirmed == true) {
+                    await DbHelper.instance.deleteRelationshipImage(img.id!);
+                    await _loadData();
+                    if (!mounted) return;
+                    if (!context.mounted) return;
+                    await Provider.of<PersonProvider>(context, listen: false).loadAll();
+                  }
+                } else {
+                  _expandPhoto(prov);
                 }
-              } else {
-                // Read mode: expand to view
-                _expandPhoto(prov);
-              }
-            },
-            child: Container(
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(4),
-                image: DecorationImage(image: prov, fit: BoxFit.cover, onError: (_, _) {}),
-                color: Colors.white,
+              },
+              child: Container(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(4),
+                  image: DecorationImage(image: prov, fit: BoxFit.cover, onError: (_, _) {}),
+                  color: Colors.white,
+                ),
+                child: isEditingGallery
+                    ? Align(
+                        alignment: Alignment.topRight,
+                        child: Container(
+                          margin: const EdgeInsets.all(4),
+                          padding: const EdgeInsets.all(3),
+                          decoration: BoxDecoration(
+                              color: Colors.black54, shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 1)),
+                          child: const Icon(Icons.close, size: 10, color: Colors.white),
+                        ),
+                      )
+                    : null,
               ),
-              child: isEditingGallery
-                  ? Align(
-                      alignment: Alignment.topRight,
-                      child: Container(
-                        margin: const EdgeInsets.all(4),
-                        padding: const EdgeInsets.all(3),
-                        decoration: BoxDecoration(color: Colors.black54, shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 1)),
-                        child: const Icon(Icons.close, size: 10, color: Colors.white),
-                      ),
-                    )
-                  : null,
             ),
           );
         },
@@ -722,9 +803,9 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
       child: Column(
         children: [
           const SizedBox(height: 8),
-          // Drag handle
           Center(
-            child: Container(width: 36, height: 4, decoration: BoxDecoration(color: Colors.white.withValues(alpha: 0.6), borderRadius: BorderRadius.circular(2))),
+            child: Container(
+                width: 36, height: 4, decoration: BoxDecoration(color: Colors.white.withValues(alpha: 0.6), borderRadius: BorderRadius.circular(2))),
           ),
           const SizedBox(height: 8),
           Expanded(
@@ -732,7 +813,6 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
                 ? const Center(child: CircularProgressIndicator(color: Colors.white))
                 : Stack(
                     children: [
-                      // Scrollable content — gallery at very bottom so user must scroll to see it
                       ListView(
                         controller: widget.scrollController,
                         padding: const EdgeInsets.fromLTRB(20, 12, 20, 88),
@@ -762,20 +842,23 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
                                   text: TextSpan(
                                     style: const TextStyle(color: Colors.white, fontSize: 11, height: 1.5),
                                     children: [
-                                      const TextSpan(text: 'Descrip......', style: TextStyle(color: Colors.white70, fontStyle: FontStyle.italic, fontSize: 10)),
-                                      TextSpan(text: _person.description.isEmpty ? ' No description.' : _person.description, style: const TextStyle(fontStyle: FontStyle.italic)),
+                                      const TextSpan(
+                                          text: 'Descrip......',
+                                          style: TextStyle(color: Colors.white70, fontStyle: FontStyle.italic, fontSize: 10)),
+                                      TextSpan(
+                                          text: _person.description.isEmpty ? ' No description.' : _person.description,
+                                          style: const TextStyle(fontStyle: FontStyle.italic)),
                                     ],
                                   ),
                                 ),
                           const SizedBox(height: 14),
                           _buildRelationshipsCompact(),
                           const SizedBox(height: 14),
-                          // Detailed sections revealed on scroll when sheet expands
                           const Divider(color: Colors.white24, height: 20),
-                          _DetailedSections(person: _person, relationships: _relationships),
+                          _DetailedSections(person: _person, relationships: _relationships, personsById: _personsById),
                           const SizedBox(height: 20),
-                          // Gallery at bottom — requires scrolling past details to see photos
-                          const Text('PHOTOS', style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700, letterSpacing: 0.8)),
+                          const Text('PHOTOS',
+                              style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700, letterSpacing: 0.8)),
                           const SizedBox(height: 8),
                           _buildGallery(),
                           const SizedBox(height: 8),
@@ -784,7 +867,6 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
                               textAlign: TextAlign.center),
                         ],
                       ),
-                      // Sticky bottom bar — edit (or check when editing) + delete / cancel when editing
                       Positioned(
                         left: 0,
                         right: 0,
@@ -794,11 +876,7 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
                           decoration: BoxDecoration(
                             color: AppColors.vividRed,
                             boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withValues(alpha: 0.18),
-                                blurRadius: 12,
-                                offset: const Offset(0, -4),
-                              ),
+                              BoxShadow(color: Colors.black.withValues(alpha: 0.18), blurRadius: 12, offset: const Offset(0, -4)),
                             ],
                             border: const Border(top: BorderSide(color: Colors.white24, width: 0.6)),
                           ),
@@ -807,9 +885,7 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
                             child: Row(
                               mainAxisAlignment: MainAxisAlignment.center,
                               children: [
-                                // Edit / Check / Cancel logic
                                 if (_isEditing) ...[
-                                  // Cancel
                                   GestureDetector(
                                     onTap: _isSaving ? null : _cancelEdit,
                                     child: Container(
@@ -823,16 +899,14 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
                                     ),
                                   ),
                                   const SizedBox(width: 16),
-                                  // Save (check)
                                   GestureDetector(
                                     onTap: _isSaving ? null : _saveEdit,
                                     child: Container(
                                       width: 52,
                                       height: 52,
-                                      decoration: BoxDecoration(
-                                          color: Colors.white,
-                                          shape: BoxShape.circle,
-                                          boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.14), blurRadius: 8, offset: const Offset(0, 2))]),
+                                      decoration: BoxDecoration(color: Colors.white, shape: BoxShape.circle, boxShadow: [
+                                        BoxShadow(color: Colors.black.withValues(alpha: 0.14), blurRadius: 8, offset: const Offset(0, 2))
+                                      ]),
                                       child: _isSaving
                                           ? const SizedBox(
                                               width: 20,
@@ -846,30 +920,26 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
                                     ),
                                   ),
                                 ] else ...[
-                                  // Edit
                                   GestureDetector(
                                     onTap: _enterEditMode,
                                     child: Container(
                                       width: 52,
                                       height: 52,
-                                      decoration: BoxDecoration(
-                                          color: AppColors.coral,
-                                          shape: BoxShape.circle,
-                                          boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.14), blurRadius: 8, offset: const Offset(0, 2))]),
+                                      decoration: BoxDecoration(color: AppColors.coral, shape: BoxShape.circle, boxShadow: [
+                                        BoxShadow(color: Colors.black.withValues(alpha: 0.14), blurRadius: 8, offset: const Offset(0, 2))
+                                      ]),
                                       child: const Icon(Icons.edit, color: Colors.white, size: 20),
                                     ),
                                   ),
                                   const SizedBox(width: 28),
-                                  // Delete
                                   GestureDetector(
                                     onTap: _confirmDelete,
                                     child: Container(
                                       width: 52,
                                       height: 52,
-                                      decoration: BoxDecoration(
-                                          color: AppColors.coral,
-                                          shape: BoxShape.circle,
-                                          boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.14), blurRadius: 8, offset: const Offset(0, 2))]),
+                                      decoration: BoxDecoration(color: AppColors.coral, shape: BoxShape.circle, boxShadow: [
+                                        BoxShadow(color: Colors.black.withValues(alpha: 0.14), blurRadius: 8, offset: const Offset(0, 2))
+                                      ]),
                                       child: const Icon(Icons.delete, color: Colors.white, size: 20),
                                     ),
                                   ),
@@ -891,7 +961,8 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
 class _DetailedSections extends StatelessWidget {
   final Person person;
   final List<Relationship> relationships;
-  const _DetailedSections({required this.person, required this.relationships});
+  final Map<int, Person> personsById;
+  const _DetailedSections({required this.person, required this.relationships, required this.personsById});
 
   @override
   Widget build(BuildContext context) {
@@ -902,29 +973,26 @@ class _DetailedSections extends StatelessWidget {
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(title.toUpperCase(), style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700, letterSpacing: 0.8)),
+          Text(title.toUpperCase(),
+              style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700, letterSpacing: 0.8)),
           const SizedBox(height: 8),
           if (rels.isEmpty)
             const Text('None', style: TextStyle(color: Colors.white60, fontStyle: FontStyle.italic, fontSize: 12))
           else
             ...rels.map((rel) {
               final otherId = rel.fromPersonId == person.id ? rel.toPersonId : rel.fromPersonId;
-              return FutureBuilder<Person?>(
-                future: DbHelper.instance.getPersonById(otherId),
-                builder: (context, snap) {
-                  final name = snap.data?.name ?? 'Unknown';
-                  return Container(
-                    margin: const EdgeInsets.only(bottom: 8),
-                    padding: const EdgeInsets.all(10),
-                    decoration: BoxDecoration(color: AppColors.bgLight, borderRadius: BorderRadius.circular(12)),
-                    child: Row(
-                      children: [
-                        Expanded(child: Text(name, style: const TextStyle(color: Color(0xFF3A0000), fontWeight: FontWeight.w600, fontSize: 12))),
-                        Text(rel.label + (rel.isMutual ? ' • Mutual' : ''), style: TextStyle(color: rel.isMutual ? AppColors.vividRed : Colors.black54, fontSize: 10)),
-                      ],
-                    ),
-                  );
-                },
+              final name = personsById[otherId]?.name ?? 'Unknown';
+              return Container(
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(color: AppColors.bgLight, borderRadius: BorderRadius.circular(12)),
+                child: Row(
+                  children: [
+                    Expanded(child: Text(name, style: const TextStyle(color: Color(0xFF3A0000), fontWeight: FontWeight.w600, fontSize: 12))),
+                    Text(rel.label + (rel.isMutual ? ' • Mutual' : ''),
+                        style: TextStyle(color: rel.isMutual ? AppColors.vividRed : Colors.black54, fontSize: 10)),
+                  ],
+                ),
               );
             }),
         ],

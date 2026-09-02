@@ -1,12 +1,14 @@
 import 'dart:io';
 import 'dart:math';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:provider/provider.dart';
 
-import '../providers/person_provider.dart';
 import '../models/person.dart';
 import '../models/relationship.dart';
+import '../providers/person_provider.dart';
 import '../theme/app_colors.dart';
 import '../widgets/profile_bottom_sheet.dart';
 import '../widgets/search_bottom_sheet.dart';
@@ -31,11 +33,20 @@ class GraphScreen extends StatefulWidget {
 class _GraphScreenState extends State<GraphScreen>
     with TickerProviderStateMixin {
   final Map<int, _PhysNode> _nodes = {};
-  late AnimationController _ticker;
+  // Cache: personId -> file exists on disk (avoid existsSync per frame)
+  final Map<int, bool> _fileExistsCache = {};
+  // Keep latest relationships for physics tick without mutating during build
+  List<Relationship> _latestRels = [];
+  // Version incremented each tick that actually moves nodes — drives CustomPainter repaint
+  int _paintVersion = 0;
+
+  late Ticker _ticker;
   late AnimationController _centerController;
   final Random _rng = Random();
   int _frameCount = 0;
+  int _idleFrames = 0;
   Size _lastGraphSize = Size.zero;
+  bool _didInitOffset = false;
 
   // Pan + zoom state
   Offset _canvasOffset = Offset.zero;
@@ -64,18 +75,13 @@ class _GraphScreenState extends State<GraphScreen>
   @override
   void initState() {
     super.initState();
-    _ticker = AnimationController(
-      vsync: this,
-      duration: const Duration(days: 1),
-    )..addListener(_tick);
-    _ticker.forward();
+    _ticker = createTicker(_tick)..start();
     _centerController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 420),
     );
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) setState(() {});
-    });
+    // Initial size probe — no need to force a second rebuild, LayoutBuilder
+    // will provide constraints on first frame.
   }
 
   @override
@@ -83,6 +89,13 @@ class _GraphScreenState extends State<GraphScreen>
     _ticker.dispose();
     _centerController.dispose();
     super.dispose();
+  }
+
+  void _ensureTickerRunning() {
+    if (!_ticker.isActive) {
+      _idleFrames = 0;
+      _ticker.start();
+    }
   }
 
   /// Smoothly pans/zooms so [personId]'s node lands centered in the graph viewport.
@@ -94,7 +107,10 @@ class _GraphScreenState extends State<GraphScreen>
     if (size.isEmpty || size.width == 0) {
       final mq = MediaQuery.maybeOf(context);
       if (mq != null) {
-        size = Size(mq.size.width, mq.size.height - 56 - 84 - mq.padding.top - mq.padding.bottom);
+        size = Size(
+          mq.size.width,
+          mq.size.height - 56 - 84 - mq.padding.top - mq.padding.bottom,
+        );
       } else {
         return;
       }
@@ -114,21 +130,48 @@ class _GraphScreenState extends State<GraphScreen>
     }
 
     anim.addListener(listener);
-    _centerController.forward(from: 0);
-    await _centerController.forward(from: 0);
-    anim.removeListener(listener);
-    node.pinned = false;
+    try {
+      await _centerController.forward(from: 0);
+    } finally {
+      anim.removeListener(listener);
+      node.pinned = false;
+      if (mounted) setState(() {});
+      _ensureTickerRunning();
+    }
   }
 
   void _syncNodes(List<Person> persons) {
     final ids = persons.map((p) => p.id!).toSet();
-    _nodes.removeWhere((id, _) => !ids.contains(id));
+    // Prune removed + clear their file cache
+    final removed = _nodes.keys.where((id) => !ids.contains(id)).toList();
+    for (final id in removed) {
+      _nodes.remove(id);
+      _fileExistsCache.remove(id);
+    }
+    bool added = false;
     for (final p in persons) {
+      // Cache file existence once per data change, not per frame
+      final isAsset = p.imagePath.startsWith('assets/');
+      if (!_fileExistsCache.containsKey(p.id)) {
+        _fileExistsCache[p.id!] =
+            !isAsset && p.imagePath.isNotEmpty && File(p.imagePath).existsSync();
+      } else {
+        // Invalidate if path changed (person mutated)
+        final existingNode = _nodes[p.id];
+        if (existingNode != null && existingNode.person.imagePath != p.imagePath) {
+          _fileExistsCache[p.id!] =
+              !isAsset && p.imagePath.isNotEmpty && File(p.imagePath).existsSync();
+        }
+      }
       if (!_nodes.containsKey(p.id)) {
+        added = true;
         Offset pos;
         if (_pendingAddCanvasPos != null) {
-          // Place new node where user tapped to add (with slight jitter)
-          pos = _pendingAddCanvasPos! + Offset((_rng.nextDouble() - 0.5) * 20, (_rng.nextDouble() - 0.5) * 20);
+          pos = _pendingAddCanvasPos! +
+              Offset(
+                (_rng.nextDouble() - 0.5) * 20,
+                (_rng.nextDouble() - 0.5) * 20,
+              );
           _pendingAddCanvasPos = null;
         } else {
           final angle = _rng.nextDouble() * 2 * pi;
@@ -137,28 +180,57 @@ class _GraphScreenState extends State<GraphScreen>
         }
         _nodes[p.id!] = _PhysNode(p, pos);
       } else {
-        _nodes[p.id!] = _PhysNode(p, _nodes[p.id!]!.pos)
-          ..vel = _nodes[p.id!]!.vel
-          ..pinned = _nodes[p.id!]!.pinned;
+        // Update person reference without losing physics state
+        final old = _nodes[p.id!]!;
+        // Only recreate wrapper if person data changed; preserve vel/pinned
+        if (old.person != p) {
+          _nodes[p.id!] = _PhysNode(p, old.pos)
+            ..vel = old.vel
+            ..pinned = old.pinned;
+        }
       }
     }
+    if (added) _ensureTickerRunning();
   }
 
-  void _tick() {
+  void _tick([Duration? _]) {
     if (!mounted) return;
-    final nodes = _nodes.values.toList();
-    if (nodes.isEmpty) return;
+    if (_nodes.isEmpty) {
+      _idleFrames++;
+      if (_idleFrames > 90 && _ticker.isActive) _ticker.stop();
+      return;
+    }
 
     _frameCount++;
-    if (_frameCount % 2 != 0) return;
+    if (_frameCount % 2 != 0) return; // throttle to ~30fps for physics
 
+    // Apply edge attraction inside tick (previously done in build, which caused
+    // state mutation during build and double work per frame).
+    for (final rel in _latestRels) {
+      final a = _nodes[rel.fromPersonId];
+      final b = _nodes[rel.toPersonId];
+      if (a == null || b == null) continue;
+      final delta = b.pos - a.pos;
+      final dist = delta.distance.clamp(1.0, double.infinity);
+      final force = _attraction * (dist - _naturalLen);
+      final dir = delta / dist;
+      if (!a.pinned) a.vel += dir * force;
+      if (!b.pinned) b.vel -= dir * force;
+    }
+
+    // Repulsion O(n²) — avoid allocating List copy each tick if possible
+    // _nodes.values is a view; converting to list once is still needed for indexed loop
+    // but we reuse the list reference locally and avoid extra collections.
+    final nodes = _nodes.values.toList(growable: false);
     for (int i = 0; i < nodes.length; i++) {
       for (int j = i + 1; j < nodes.length; j++) {
         final a = nodes[i];
         final b = nodes[j];
         final delta = a.pos - b.pos;
-        final dist = delta.distance.clamp(1.0, double.infinity);
-        final force = (_repulsion / (dist * dist));
+        final dist2 = delta.distanceSquared;
+        // Clamp dist implicitly via max(1, sqrt) but use distanceSquared for perf
+        final dist = dist2 < 1.0 ? 1.0 : sqrt(dist2);
+        final force = _repulsion / (dist * dist);
         final dir = delta / dist;
         if (!a.pinned) a.vel += dir * force;
         if (!b.pinned) b.vel -= dir * force;
@@ -174,10 +246,20 @@ class _GraphScreenState extends State<GraphScreen>
     double maxVel = 0;
     for (final n in nodes) {
       if (n.pinned) continue;
-      maxVel = maxVel > n.vel.distance ? maxVel : n.vel.distance;
+      final d = n.vel.distance;
+      if (d > maxVel) maxVel = d;
     }
-    if (maxVel < 0.05 && _draggingId == null) return;
+    if (maxVel < 0.05 && _draggingId == null) {
+      _idleFrames++;
+      // Sleep ticker after ~1.5s idle to save battery and avoid constant rebuilds
+      if (_idleFrames > 45 && _ticker.isActive) {
+        _ticker.stop();
+      }
+      return;
+    }
+    _idleFrames = 0;
 
+    // Apply damping + integrate — batched in single setState to avoid intermediate invalidations
     if (mounted) {
       setState(() {
         for (final n in nodes) {
@@ -185,21 +267,8 @@ class _GraphScreenState extends State<GraphScreen>
           n.vel *= _damping;
           n.pos += n.vel;
         }
+        _paintVersion++;
       });
-    }
-  }
-
-  void _applyEdgeForces(List<Relationship> rels) {
-    for (final rel in rels) {
-      final a = _nodes[rel.fromPersonId];
-      final b = _nodes[rel.toPersonId];
-      if (a == null || b == null) continue;
-      final delta = b.pos - a.pos;
-      final dist = delta.distance.clamp(1.0, double.infinity);
-      final force = _attraction * (dist - _naturalLen);
-      final dir = delta / dist;
-      if (!a.pinned) a.vel += dir * force;
-      if (!b.pinned) b.vel -= dir * force;
     }
   }
 
@@ -210,7 +279,6 @@ class _GraphScreenState extends State<GraphScreen>
   Offset _toScreen(Offset canvas) => canvas * _scale + _canvasOffset;
 
   _PhysNode? _hitTest(Offset canvasPos) {
-    // Slightly larger hit radius (avatar + white border + shadow) for forgiving drag
     const hitPadding = 8.0;
     for (final n in _nodes.values) {
       if ((n.pos - canvasPos).distance < _nodeRadius + hitPadding) return n;
@@ -259,13 +327,9 @@ class _GraphScreenState extends State<GraphScreen>
               onPressed: () async {
                 final selected = await showSearchBottomSheet(context);
                 if (selected != null && context.mounted) {
-                  // 1) sheet already popped via Navigator.pop(result)
-                  // 2) center node's viewport with smooth pan
                   await _centerOnPerson(selected.id!);
-                  // 3) brief pause for user to register centering
                   await Future.delayed(const Duration(milliseconds: 220));
                   if (!context.mounted) return;
-                  // 4) present profile as bottom sheet - full flow
                   showProfileBottomSheet(context, selected);
                 }
               },
@@ -282,8 +346,13 @@ class _GraphScreenState extends State<GraphScreen>
           Expanded(
             child: Consumer<PersonProvider>(
               builder: (context, provider, _) {
-                debugPrint('GraphScreen build: persons=${provider.persons.length} rels=${provider.relationships.length} nodes=${_nodes.length}');
+                if (kDebugMode) {
+                  debugPrint(
+                    'GraphScreen build: persons=${provider.persons.length} rels=${provider.relationships.length} nodes=${_nodes.length}',
+                  );
+                }
                 if (provider.persons.isEmpty) {
+                  _latestRels = const [];
                   return Stack(
                     children: [
                       const Center(
@@ -298,19 +367,25 @@ class _GraphScreenState extends State<GraphScreen>
                         bottom: 12,
                         child: Text(
                           'Debug: 0 persons (DB empty or seeding failed)\nTry: adb shell pm clear com.example.situationship then rerun',
-                          style: TextStyle(color: Colors.black.withValues(alpha: 0.5), fontSize: 10),
+                          style: TextStyle(
+                            color: Colors.black.withValues(alpha: 0.5),
+                            fontSize: 10,
+                          ),
                         ),
                       ),
                     ],
                   );
                 }
 
-                final needsSync = provider.persons.any((p) => !_nodes.containsKey(p.id)) ||
-                    _nodes.length != provider.persons.length;
+                final needsSync =
+                    provider.persons.any((p) => !_nodes.containsKey(p.id)) ||
+                        _nodes.length != provider.persons.length ||
+                        provider.persons.any((p) => _nodes[p.id]?.person != p);
                 if (needsSync) {
                   _syncNodes(provider.persons);
                 }
-                _applyEdgeForces(provider.relationships);
+                // Store latest rels for physics tick — assignment only, no velocity mutation here
+                _latestRels = provider.relationships;
 
                 return Stack(
                   children: [
@@ -336,240 +411,248 @@ class _GraphScreenState extends State<GraphScreen>
               },
             ),
           ),
-          // Bottom red divider like mock
           Container(height: 1, color: AppColors.vividRed),
-          // Bottom pale area (30% like mock) - keeps layout proportions
-          Container(
-            height: 84,
-            width: double.infinity,
-            color: AppColors.bgLight,
-          ),
+          Container(height: 84, width: double.infinity, color: AppColors.bgLight),
         ],
       ),
-
     );
   }
 
   Widget _buildInteractiveGraph(PersonProvider provider) {
-    return LayoutBuilder(builder: (context, constraints) {
-      // Capture size for centering animation
-      _lastGraphSize = Size(constraints.maxWidth, constraints.maxHeight);
-      if (_canvasOffset == Offset.zero && constraints.maxWidth > 0) {
-        _canvasOffset = Offset(constraints.maxWidth / 2, constraints.maxHeight / 2);
-      }
-      return GestureDetector(
-        onScaleStart: (details) {
-          _focalPointStart = details.localFocalPoint;
-          _canvasOffsetStart = _canvasOffset;
-          _scaleStart = _scale;
-          _didDrag = false;
-          // Any pan/zoom or drag hides contextual add button
-          if (_tapAddPos != null) setState(() => _tapAddPos = null);
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        _lastGraphSize = Size(constraints.maxWidth, constraints.maxHeight);
+        if (!_didInitOffset && _canvasOffset == Offset.zero && constraints.maxWidth > 0) {
+          // One-time centering without triggering an extra rebuild loop.
+          _canvasOffset = Offset(constraints.maxWidth / 2, constraints.maxHeight / 2);
+          _didInitOffset = true;
+        }
+        return GestureDetector(
+          onScaleStart: (details) {
+            _focalPointStart = details.localFocalPoint;
+            _canvasOffsetStart = _canvasOffset;
+            _scaleStart = _scale;
+            _didDrag = false;
+            _ensureTickerRunning();
+            if (_tapAddPos != null) setState(() => _tapAddPos = null);
 
-          final canvasPos = _toCanvas(details.localFocalPoint);
-          final hit = _hitTest(canvasPos);
-          if (hit != null) {
-            _draggingId = hit.person.id;
-            hit.pinned = true;
-            _dragLocalStart = canvasPos - hit.pos;
-          }
-        },
-        onScaleUpdate: (details) {
-          if (_draggingId != null && details.pointerCount == 1) {
-            final node = _nodes[_draggingId!];
-            if (node != null) {
-              final canvasPos = _toCanvas(details.localFocalPoint);
-              _didDrag = true;
+            final canvasPos = _toCanvas(details.localFocalPoint);
+            final hit = _hitTest(canvasPos);
+            if (hit != null) {
+              _draggingId = hit.person.id;
+              hit.pinned = true;
+              _dragLocalStart = canvasPos - hit.pos;
+            }
+          },
+          onScaleUpdate: (details) {
+            if (_draggingId != null && details.pointerCount == 1) {
+              final node = _nodes[_draggingId!];
+              if (node != null) {
+                final canvasPos = _toCanvas(details.localFocalPoint);
+                _didDrag = true;
+                setState(() {
+                  node.pos = canvasPos - _dragLocalStart;
+                  node.vel = Offset.zero;
+                });
+                _paintVersion++;
+              }
+            } else if (_draggingId == null) {
+              if ((details.localFocalPoint - _focalPointStart).distance > 6) _didDrag = true;
               setState(() {
-                node.pos = canvasPos - _dragLocalStart;
-                node.vel = Offset.zero;
+                _scale = (_scaleStart * details.scale).clamp(0.2, 3.0);
+                _canvasOffset = _canvasOffsetStart + (details.localFocalPoint - _focalPointStart);
               });
             }
-          } else if (_draggingId == null) {
-            // Pan threshold to distinguish tap vs drag
-            if ((details.localFocalPoint - _focalPointStart).distance > 6) _didDrag = true;
-            setState(() {
-              _scale = (_scaleStart * details.scale).clamp(0.2, 3.0);
-              _canvasOffset = _canvasOffsetStart + (details.localFocalPoint - _focalPointStart);
+          },
+          onScaleEnd: (_) {
+            if (_draggingId != null) {
+              _nodes[_draggingId!]?.pinned = false;
+              _ensureTickerRunning();
+            }
+            Future.delayed(const Duration(milliseconds: 150), () {
+              _didDrag = false;
             });
-          }
-        },
-        onScaleEnd: (_) {
-          if (_draggingId != null) {
-            _nodes[_draggingId!]?.pinned = false;
-          }
-          // Keep didDrag true briefly so onTapUp can ignore
-          Future.delayed(const Duration(milliseconds: 150), () {
-            _didDrag = false;
-          });
-          _draggingId = null;
-        },
-        onTapUp: (details) {
-          if (_didDrag) {
-            // Was a drag/pan — ignore tap
-            _didDrag = false;
-            return;
-          }
-          final canvasPos = _toCanvas(details.localPosition);
-          final hit = _hitTest(canvasPos);
-          if (hit != null) {
-            setState(() => _tapAddPos = null);
-            showProfileBottomSheet(context, hit.person);
-          } else {
-            // Tapped empty space (or near nodes) -> show contextual add button at tap location
-            final clamped = Offset(
-              details.localPosition.dx.clamp(28.0, constraints.maxWidth - 28.0),
-              details.localPosition.dy.clamp(28.0, constraints.maxHeight - 28.0),
-            );
-            setState(() {
-              _tapAddPos = clamped;
-              _tapAddTime = DateTime.now();
-            });
-            // Auto-hide after 4s
-            Future.delayed(const Duration(seconds: 4), () {
-              if (!mounted) return;
-              if (_tapAddTime != null && DateTime.now().difference(_tapAddTime!).inSeconds >= 4) {
-                setState(() => _tapAddPos = null);
-              }
-            });
-          }
-        },
-        child: Stack(
-          children: [
-            // Dismiss add button when tapping empty again elsewhere: handled by onTapUp outside
-            // Edges behind nodes
-            CustomPaint(
-              painter: _EdgePainter(
-                nodes: _nodes,
-                relationships: provider.relationships,
-                canvasOffset: _canvasOffset,
-                scale: _scale,
-                nodeRadius: _nodeRadius,
-              ),
-              child: const SizedBox.expand(),
-            ),
-            // Nodes as widgets (avatar images + tags) on top of edges
-            ..._nodes.values.map((node) {
-              final center = _toScreen(node.pos);
-              final r = _nodeRadius * _scale;
-              final isAsset = node.person.imagePath.startsWith('assets/');
-              final fileExists = !isAsset && File(node.person.imagePath).existsSync();
-
-              Widget avatar;
-              if (isAsset) {
-                avatar = CircleAvatar(
-                  radius: r,
-                  backgroundImage: AssetImage(node.person.imagePath),
-                  backgroundColor: Colors.white,
-                  onBackgroundImageError: (_, _) {},
-                );
-              } else if (fileExists) {
-                avatar = CircleAvatar(
-                  radius: r,
-                  backgroundImage: FileImage(File(node.person.imagePath)),
-                  backgroundColor: Colors.white,
-                );
-              } else {
-                final initial = node.person.name.isNotEmpty ? node.person.name[0].toUpperCase() : '?';
-                avatar = CircleAvatar(
-                  radius: r,
-                  backgroundColor: Colors.white,
-                  child: Text(
-                    initial,
-                    style: TextStyle(
-                      color: AppColors.vividRed,
-                      fontWeight: FontWeight.bold,
-                      fontSize: r * 0.7,
-                    ),
-                  ),
-                );
-              }
-
-              return Positioned(
-                left: center.dx - r,
-                top: center.dy - r,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Container(
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        border: Border.all(color: Colors.white, width: 2),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.12),
-                            blurRadius: 6,
-                            offset: const Offset(0, 2),
-                          ),
-                        ],
-                      ),
-                      child: avatar,
-                    ),
-                    const SizedBox(height: 4),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                      decoration: BoxDecoration(
-                        color: Colors.white.withValues(alpha: 0.95),
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: AppColors.coral.withValues(alpha: 0.2)),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.06),
-                            blurRadius: 4,
-                          ),
-                        ],
-                      ),
-                      child: Text(
-                        node.person.name.split(' ').first,
-                        style: TextStyle(
-                          color: Colors.black87,
-                          fontSize: (10 * _scale).clamp(8.0, 11.0),
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
+            _draggingId = null;
+          },
+          onTapUp: (details) {
+            if (_didDrag) {
+              _didDrag = false;
+              return;
+            }
+            final canvasPos = _toCanvas(details.localPosition);
+            final hit = _hitTest(canvasPos);
+            if (hit != null) {
+              setState(() => _tapAddPos = null);
+              showProfileBottomSheet(context, hit.person);
+            } else {
+              final clamped = Offset(
+                details.localPosition.dx.clamp(28.0, constraints.maxWidth - 28.0),
+                details.localPosition.dy.clamp(28.0, constraints.maxHeight - 28.0),
               );
-            }),
-            // Contextual add button at tap location (empty space tap)
-            if (_tapAddPos != null)
-              Positioned(
-                left: _tapAddPos!.dx - 24,
-                top: _tapAddPos!.dy - 24,
-                child: Material(
-                  elevation: 6,
-                  shape: const CircleBorder(),
-                  color: Colors.transparent,
-                  child: GestureDetector(
-                    onTap: () {
-                      // Store canvas position so new node appears where user tapped
-                      _pendingAddCanvasPos = _toCanvas(_tapAddPos!);
-                      setState(() => _tapAddPos = null);
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(builder: (_) => const AddNodeWizardScreen()),
-                      );
-                    },
-                    child: Container(
-                      width: 48,
-                      height: 48,
-                      decoration: BoxDecoration(
-                        color: AppColors.coral,
-                        shape: BoxShape.circle,
-                        border: Border.all(color: Colors.white, width: 2),
-                        boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.2), blurRadius: 8, offset: const Offset(0, 3))],
+              setState(() {
+                _tapAddPos = clamped;
+                _tapAddTime = DateTime.now();
+              });
+              Future.delayed(const Duration(seconds: 4), () {
+                if (!mounted) return;
+                if (_tapAddTime != null &&
+                    DateTime.now().difference(_tapAddTime!).inSeconds >= 4) {
+                  setState(() => _tapAddPos = null);
+                }
+              });
+            }
+          },
+          child: Stack(
+            children: [
+              // Edges behind nodes — isolated repaint
+              RepaintBoundary(
+                child: CustomPaint(
+                  painter: _EdgePainter(
+                    nodes: _nodes,
+                    relationships: provider.relationships,
+                    canvasOffset: _canvasOffset,
+                    scale: _scale,
+                    nodeRadius: _nodeRadius,
+                    version: _paintVersion,
+                  ),
+                  child: const SizedBox.expand(),
+                ),
+              ),
+              // Nodes — each avatar isolated with RepaintBoundary to avoid full-stack repaint on decodes
+              ..._nodes.values.map((node) {
+                final center = _toScreen(node.pos);
+                final r = _nodeRadius * _scale;
+                final isAsset = node.person.imagePath.startsWith('assets/');
+                final fileExists = _fileExistsCache[node.person.id] ?? false;
+
+                Widget avatar;
+                if (isAsset) {
+                  avatar = CircleAvatar(
+                    radius: r,
+                    backgroundImage: AssetImage(node.person.imagePath),
+                    backgroundColor: Colors.white,
+                    onBackgroundImageError: (_, _) {},
+                  );
+                } else if (fileExists) {
+                  // Use ResizeImage to decode at ~2x display size, not full file resolution.
+                  final targetPx = (r * 2 * MediaQuery.devicePixelRatioOf(context)).round().clamp(48, 256);
+                  avatar = CircleAvatar(
+                    radius: r,
+                    backgroundImage: ResizeImage(
+                      FileImage(File(node.person.imagePath)),
+                      width: targetPx,
+                      height: targetPx,
+                    ),
+                    backgroundColor: Colors.white,
+                    onBackgroundImageError: (_, _) {},
+                  );
+                } else {
+                  final initial = node.person.name.isNotEmpty ? node.person.name[0].toUpperCase() : '?';
+                  avatar = CircleAvatar(
+                    radius: r,
+                    backgroundColor: Colors.white,
+                    child: Text(
+                      initial,
+                      style: TextStyle(
+                        color: AppColors.vividRed,
+                        fontWeight: FontWeight.bold,
+                        fontSize: r * 0.7,
                       ),
-                      child: const Icon(Icons.add, color: Colors.white, size: 24),
+                    ),
+                  );
+                }
+
+                return Positioned(
+                  left: center.dx - r,
+                  top: center.dy - r,
+                  child: RepaintBoundary(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            border: Border.all(color: Colors.white, width: 2),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withValues(alpha: 0.12),
+                                blurRadius: 6,
+                                offset: const Offset(0, 2),
+                              ),
+                            ],
+                          ),
+                          child: avatar,
+                        ),
+                        const SizedBox(height: 4),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.95),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: AppColors.coral.withValues(alpha: 0.2)),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withValues(alpha: 0.06),
+                                blurRadius: 4,
+                              ),
+                            ],
+                          ),
+                          child: Text(
+                            node.person.name.split(' ').first,
+                            style: TextStyle(
+                              color: Colors.black87,
+                              fontSize: (10 * _scale).clamp(8.0, 11.0),
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              }),
+              if (_tapAddPos != null)
+                Positioned(
+                  left: _tapAddPos!.dx - 24,
+                  top: _tapAddPos!.dy - 24,
+                  child: Material(
+                    elevation: 6,
+                    shape: const CircleBorder(),
+                    color: Colors.transparent,
+                    child: GestureDetector(
+                      onTap: () {
+                        _pendingAddCanvasPos = _toCanvas(_tapAddPos!);
+                        setState(() => _tapAddPos = null);
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(builder: (_) => const AddNodeWizardScreen()),
+                        );
+                      },
+                      child: Container(
+                        width: 48,
+                        height: 48,
+                        decoration: BoxDecoration(
+                          color: AppColors.coral,
+                          shape: BoxShape.circle,
+                          border: Border.all(color: Colors.white, width: 2),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withValues(alpha: 0.2),
+                              blurRadius: 8,
+                              offset: const Offset(0, 3),
+                            ),
+                          ],
+                        ),
+                        child: const Icon(Icons.add, color: Colors.white, size: 24),
+                      ),
                     ),
                   ),
                 ),
-              ),
-
-          ],
-        ),
-      );
-    });
+            ],
+          ),
+        );
+      },
+    );
   }
 }
 
@@ -579,6 +662,7 @@ class _EdgePainter extends CustomPainter {
   final Offset canvasOffset;
   final double scale;
   final double nodeRadius;
+  final int version;
 
   _EdgePainter({
     required this.nodes,
@@ -586,12 +670,27 @@ class _EdgePainter extends CustomPainter {
     required this.canvasOffset,
     required this.scale,
     required this.nodeRadius,
+    required this.version,
   });
 
   Offset _toScreen(Offset canvas) => canvas * scale + canvasOffset;
 
   @override
   void paint(Canvas canvas, Size size) {
+    // Cheap culling: skip edges fully offscreen (expanded by label bg + arrow)
+    final margin = 80 * scale;
+
+    // Reuse paints — avoid allocating per edge per frame
+    final bgPaint = Paint()..color = Colors.white.withValues(alpha: 0.92);
+    final bgBorderMutual = Paint()
+      ..color = AppColors.vividRed.withValues(alpha: 0.2)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.8;
+    final bgBorderNormal = Paint()
+      ..color = Colors.black12.withValues(alpha: 0.2)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.8;
+
     for (final rel in relationships) {
       final a = nodes[rel.fromPersonId];
       final b = nodes[rel.toPersonId];
@@ -600,35 +699,42 @@ class _EdgePainter extends CustomPainter {
       final from = _toScreen(a.pos);
       final to = _toScreen(b.pos);
 
-      // Shorten line so it stops at node borders (arrow not blocked by widget)
-      final edgeGap = nodeRadius * scale + 14;
-      final dirUnit = (to - from) / (to - from).distance;
-      final lineFrom = from + dirUnit * edgeGap;
-      final lineTo = to - dirUnit * edgeGap;
-      // Skip if nodes too close
-      if ((lineTo - lineFrom).distance < 1) {
-        _drawArrow(canvas, from, to, rel.isMutual);
-      } else {
-        final edgePaint = Paint()
-          ..color = rel.isMutual ? AppColors.vividRed.withValues(alpha: 0.9) : Colors.black.withValues(alpha: 0.75)
-          ..strokeWidth = rel.isMutual ? 1.6 * scale : 1.0 * scale
-          ..style = PaintingStyle.stroke;
-
-        canvas.drawLine(lineFrom, lineTo, edgePaint);
-
-        _drawArrow(canvas, from, to, rel.isMutual);
+      // Frustum cull: if both endpoints offscreen on same side, skip paint + label
+      if ((from.dx < -margin && to.dx < -margin) ||
+          (from.dx > size.width + margin && to.dx > size.width + margin) ||
+          (from.dy < -margin && to.dy < -margin) ||
+          (from.dy > size.height + margin && to.dy > size.height + margin)) {
+        continue;
       }
 
-      _drawEdgeLabel(canvas, from, to, rel.label, rel.isMutual);
+      final dirVec = to - from;
+      final len = dirVec.distance;
+      if (len < 1) continue;
+      final dirUnit = dirVec / len;
+      final edgeGap = nodeRadius * scale + 14;
+      final lineFrom = from + dirUnit * edgeGap;
+      final lineTo = to - dirUnit * edgeGap;
+
+      if ((lineTo - lineFrom).distance >= 1) {
+        final edgePaint = Paint()
+          ..color = rel.isMutual
+              ? AppColors.vividRed.withValues(alpha: 0.9)
+              : Colors.black.withValues(alpha: 0.75)
+          ..strokeWidth = (rel.isMutual ? 1.6 : 1.0) * scale
+          ..style = PaintingStyle.stroke;
+        canvas.drawLine(lineFrom, lineTo, edgePaint);
+      }
+      _drawArrow(canvas, from, to, rel.isMutual);
+      _drawEdgeLabel(canvas, from, to, rel.label, rel.isMutual, bgPaint,
+          rel.isMutual ? bgBorderMutual : bgBorderNormal);
     }
   }
 
   void _drawArrow(Canvas canvas, Offset from, Offset to, bool mutual) {
-    final dir = (to - from);
+    final dir = to - from;
     final len = dir.distance;
     if (len < 1) return;
     final unit = dir / len;
-    // Tip outside the node's circular widget (radius + white border + shadow)
     final tipOffset = nodeRadius * scale + 14;
     final tip = to - unit * tipOffset;
 
@@ -660,12 +766,16 @@ class _EdgePainter extends CustomPainter {
       final fromUnit = -unit;
       final fromTip = from - fromUnit * (-(nodeRadius * scale + 14));
       final fromLeft = Offset(
-        fromTip.dx - arrowLen * (fromUnit.dx * cos(arrowAngle) - fromUnit.dy * sin(arrowAngle)),
-        fromTip.dy - arrowLen * (fromUnit.dy * cos(arrowAngle) + fromUnit.dx * sin(arrowAngle)),
+        fromTip.dx -
+            arrowLen * (fromUnit.dx * cos(arrowAngle) - fromUnit.dy * sin(arrowAngle)),
+        fromTip.dy -
+            arrowLen * (fromUnit.dy * cos(arrowAngle) + fromUnit.dx * sin(arrowAngle)),
       );
       final fromRight = Offset(
-        fromTip.dx - arrowLen * (fromUnit.dx * cos(-arrowAngle) - fromUnit.dy * sin(-arrowAngle)),
-        fromTip.dy - arrowLen * (fromUnit.dy * cos(-arrowAngle) + fromUnit.dx * sin(-arrowAngle)),
+        fromTip.dx -
+            arrowLen * (fromUnit.dx * cos(-arrowAngle) - fromUnit.dy * sin(-arrowAngle)),
+        fromTip.dy -
+            arrowLen * (fromUnit.dy * cos(-arrowAngle) + fromUnit.dx * sin(-arrowAngle)),
       );
       final fromArrow = Path()
         ..moveTo(fromTip.dx, fromTip.dy)
@@ -681,7 +791,15 @@ class _EdgePainter extends CustomPainter {
     }
   }
 
-  void _drawEdgeLabel(Canvas canvas, Offset from, Offset to, String label, bool mutual) {
+  void _drawEdgeLabel(
+    Canvas canvas,
+    Offset from,
+    Offset to,
+    String label,
+    bool mutual,
+    Paint bg,
+    Paint border,
+  ) {
     if (label.isEmpty) return;
     final mid = (from + to) / 2;
     final tp = TextPainter(
@@ -696,26 +814,21 @@ class _EdgePainter extends CustomPainter {
       ),
       textDirection: TextDirection.ltr,
     )..layout();
-    final bgRect = Rect.fromCenter(
-      center: mid,
-      width: tp.width + 8,
-      height: tp.height + 4,
-    );
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(bgRect, const Radius.circular(6)),
-      Paint()..color = Colors.white.withValues(alpha: 0.92),
-    );
-    // subtle border
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(bgRect, const Radius.circular(6)),
-      Paint()
-        ..color = (mutual ? AppColors.vividRed : Colors.black12).withValues(alpha: 0.2)
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 0.8,
-    );
+    final bgRect = Rect.fromCenter(center: mid, width: tp.width + 8, height: tp.height + 4);
+    final rrect = RRect.fromRectAndRadius(bgRect, const Radius.circular(6));
+    canvas.drawRRect(rrect, bg);
+    canvas.drawRRect(rrect, border);
     tp.paint(canvas, mid - Offset(tp.width / 2, tp.height / 2));
   }
 
   @override
-  bool shouldRepaint(_EdgePainter old) => true;
+  bool shouldRepaint(covariant _EdgePainter old) {
+    // Version bump on every physics move ensures repaint only when needed;
+    // also repaint on pan/zoom or relationship change.
+    return version != old.version ||
+        canvasOffset != old.canvasOffset ||
+        scale != old.scale ||
+        !identical(relationships, old.relationships) ||
+        relationships.length != old.relationships.length;
+  }
 }
