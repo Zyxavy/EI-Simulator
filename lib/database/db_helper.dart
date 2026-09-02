@@ -22,9 +22,10 @@ class DbHelper {
     final path = join(dbPath, filePath);
     return await openDatabase(
       path,
-      version: 1,
+      version: 2,
       onConfigure: (db) async => await db.execute('PRAGMA foreign_keys = ON'),
       onCreate: _createDB,
+      onUpgrade: _upgradeDB,
     );
   }
 
@@ -62,6 +63,23 @@ class DbHelper {
         FOREIGN KEY (relationshipId) REFERENCES Relationship(id) ON DELETE CASCADE
       )
     ''');
+
+    // Indexes for search/lookup hot paths — avoid full table scans on every keystroke
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_person_name ON Person(name COLLATE NOCASE)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_person_personality ON Person(personality COLLATE NOCASE)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_rel_from ON Relationship(fromPersonId)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_rel_to ON Relationship(toPersonId)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_rel_image_relId ON RelationshipImage(relationshipId)');
+  }
+
+  Future<void> _upgradeDB(Database db, int oldVersion, int newVersion) async {
+    if (oldVersion < 2) {
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_person_name ON Person(name COLLATE NOCASE)');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_person_personality ON Person(personality COLLATE NOCASE)');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_rel_from ON Relationship(fromPersonId)');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_rel_to ON Relationship(toPersonId)');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_rel_image_relId ON RelationshipImage(relationshipId)');
+    }
   }
 
   //PERSON CRUD
@@ -103,13 +121,14 @@ class DbHelper {
     return await db.delete('Person', where: 'id = ?', whereArgs: [id]);
   }
 
-  // SEARCH
+  // SEARCH — uses indexes on name/personality; LIMIT avoids scanning large result
   Future<List<Person>> searchPersons(String query) async {
     final db = await database;
     final maps = await db.query(
       'Person',
-      where: 'name LIKE ? OR personality LIKE ?',
+      where: 'name LIKE ? COLLATE NOCASE OR personality LIKE ? COLLATE NOCASE',
       whereArgs: ['%$query%', '%$query%'],
+      limit: 50,
     );
     return maps.map((m) => Person.fromMap(m)).toList();
   }

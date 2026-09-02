@@ -61,7 +61,12 @@ class _EditSheetContentState extends State<_EditSheetContent> {
   }
 
   Future<void> _pickImage() async {
-    final XFile? p = await _picker.pickImage(source: ImageSource.gallery);
+    final XFile? p = await _picker.pickImage(
+      source: ImageSource.gallery,
+      maxWidth: 1024,
+      maxHeight: 1024,
+      imageQuality: 85,
+    );
     if (p != null) setState(() => _imagePath = p.path);
   }
 

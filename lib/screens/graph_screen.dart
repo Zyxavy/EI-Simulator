@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
@@ -13,6 +14,124 @@ import '../theme/app_colors.dart';
 import '../widgets/profile_bottom_sheet.dart';
 import '../widgets/search_bottom_sheet.dart';
 import 'add_node_wizard_screen.dart';
+
+// Isolate payload for large graphs (>80 nodes). Uses primitive doubles to avoid
+// SendPort serialization cost of Offset objects. Falls back to main isolate
+// for small graphs (overhead > benefit).
+class _NodeInput {
+  final int id;
+  final double x, y, vx, vy;
+  final bool pinned;
+  const _NodeInput(this.id, this.x, this.y, this.vx, this.vy, this.pinned);
+}
+
+class _RelInput {
+  final int from, to;
+  const _RelInput(this.from, this.to);
+}
+
+class _PhysicsInput {
+  final List<_NodeInput> nodes;
+  final List<_RelInput> rels;
+  final double repulsion, attraction, naturalLen, damping, centerGravity;
+  const _PhysicsInput({
+    required this.nodes,
+    required this.rels,
+    required this.repulsion,
+    required this.attraction,
+    required this.naturalLen,
+    required this.damping,
+    required this.centerGravity,
+  });
+}
+
+class _NodeOutput {
+  final int id;
+  final double x, y, vx, vy;
+  const _NodeOutput(this.id, this.x, this.y, this.vx, this.vy);
+}
+
+// Top-level so it can be sent to Isolate.run
+List<_NodeOutput> _computePhysicsInIsolate(_PhysicsInput input) {
+  final nodes = input.nodes;
+  final rels = input.rels;
+  // Copy mutable velocities/positions into maps for quick lookup
+  final posX = <int, double>{for (final n in nodes) n.id: n.x};
+  final posY = <int, double>{for (final n in nodes) n.id: n.y};
+  final velX = <int, double>{for (final n in nodes) n.id: n.vx};
+  final velY = <int, double>{for (final n in nodes) n.id: n.vy};
+  final pinned = <int, bool>{for (final n in nodes) n.id: n.pinned};
+
+  // Edge attraction
+  for (final rel in rels) {
+    final ax = posX[rel.from];
+    final ay = posY[rel.from];
+    final bx = posX[rel.to];
+    final by = posY[rel.to];
+    if (ax == null || ay == null || bx == null || by == null) continue;
+    if (pinned[rel.from] == true && pinned[rel.to] == true) continue;
+    final dx = bx - ax;
+    final dy = by - ay;
+    final dist = sqrt(dx * dx + dy * dy).clamp(1.0, double.infinity);
+    final force = input.attraction * (dist - input.naturalLen);
+    final ux = dx / dist;
+    final uy = dy / dist;
+    if (pinned[rel.from] != true) {
+      velX[rel.from] = (velX[rel.from] ?? 0) + ux * force;
+      velY[rel.from] = (velY[rel.from] ?? 0) + uy * force;
+    }
+    if (pinned[rel.to] != true) {
+      velX[rel.to] = (velX[rel.to] ?? 0) - ux * force;
+      velY[rel.to] = (velY[rel.to] ?? 0) - uy * force;
+    }
+  }
+
+  // Node repulsion O(n²)
+  for (int i = 0; i < nodes.length; i++) {
+    for (int j = i + 1; j < nodes.length; j++) {
+      final a = nodes[i];
+      final b = nodes[j];
+      final ax = posX[a.id]!;
+      final ay = posY[a.id]!;
+      final bx = posX[b.id]!;
+      final by = posY[b.id]!;
+      final dx = ax - bx;
+      final dy = ay - by;
+      final dist2 = dx * dx + dy * dy;
+      final dist = dist2 < 1.0 ? 1.0 : sqrt(dist2);
+      final force = input.repulsion / (dist * dist);
+      final ux = dx / dist;
+      final uy = dy / dist;
+      if (!a.pinned) {
+        velX[a.id] = (velX[a.id] ?? 0) + ux * force;
+        velY[a.id] = (velY[a.id] ?? 0) + uy * force;
+      }
+      if (!b.pinned) {
+        velX[b.id] = (velX[b.id] ?? 0) - ux * force;
+        velY[b.id] = (velY[b.id] ?? 0) - uy * force;
+      }
+    }
+  }
+
+  // Center gravity + integrate + damping, return new state
+  final out = <_NodeOutput>[];
+  for (final n in nodes) {
+    if (n.pinned) {
+      out.add(_NodeOutput(n.id, n.x, n.y, n.vx, n.vy));
+      continue;
+    }
+    double vx = velX[n.id] ?? 0;
+    double vy = velY[n.id] ?? 0;
+    vx -= n.x * input.centerGravity;
+    vy -= n.y * input.centerGravity;
+    vx *= input.damping;
+    vy *= input.damping;
+    final nx = n.x + vx;
+    final ny = n.y + vy;
+    out.add(_NodeOutput(n.id, nx, ny, vx, vy));
+  }
+  return out;
+}
 
 class _PhysNode {
   final Person person;
@@ -30,14 +149,11 @@ class GraphScreen extends StatefulWidget {
   State<GraphScreen> createState() => _GraphScreenState();
 }
 
-class _GraphScreenState extends State<GraphScreen>
-    with TickerProviderStateMixin {
+class _GraphScreenState extends State<GraphScreen> with TickerProviderStateMixin {
   final Map<int, _PhysNode> _nodes = {};
-  // Cache: personId -> file exists on disk (avoid existsSync per frame)
   final Map<int, bool> _fileExistsCache = {};
-  // Keep latest relationships for physics tick without mutating during build
+  final Map<int, ImageProvider> _avatarProviderCache = {};
   List<Relationship> _latestRels = [];
-  // Version incremented each tick that actually moves nodes — drives CustomPainter repaint
   int _paintVersion = 0;
 
   late Ticker _ticker;
@@ -47,19 +163,18 @@ class _GraphScreenState extends State<GraphScreen>
   int _idleFrames = 0;
   Size _lastGraphSize = Size.zero;
   bool _didInitOffset = false;
+  bool _isComputingIsolate = false;
 
-  // Pan + zoom state
+  // Pan + zoom
   Offset _canvasOffset = Offset.zero;
   double _scale = 1.0;
   Offset _focalPointStart = Offset.zero;
   Offset _canvasOffsetStart = Offset.zero;
   double _scaleStart = 1.0;
 
-  // Drag state
   int? _draggingId;
   Offset _dragLocalStart = Offset.zero;
 
-  // Contextual add button (appears at tap location on empty canvas, per spec)
   Offset? _tapAddPos;
   DateTime? _tapAddTime;
   Offset? _pendingAddCanvasPos;
@@ -72,6 +187,13 @@ class _GraphScreenState extends State<GraphScreen>
   static const double _damping = 0.75;
   static const double _centerGravity = 0.002;
 
+  // Hoisted consts — avoid `withValues(alpha:)` allocation per frame
+  static const Color _shadowColor = Color(0x1F000000); // 12%
+  static const Color _shadowColorLight = Color(0x0F000000); // 6%
+  static const Color _avatarBorder = Colors.white;
+  static const BoxShadow _avatarShadow = BoxShadow(color: _shadowColor, blurRadius: 4, offset: Offset(0, 1));
+  static const BoxShadow _labelShadow = BoxShadow(color: _shadowColorLight, blurRadius: 2, offset: Offset(0, 1));
+
   @override
   void initState() {
     super.initState();
@@ -80,8 +202,6 @@ class _GraphScreenState extends State<GraphScreen>
       vsync: this,
       duration: const Duration(milliseconds: 420),
     );
-    // Initial size probe — no need to force a second rebuild, LayoutBuilder
-    // will provide constraints on first frame.
   }
 
   @override
@@ -98,29 +218,20 @@ class _GraphScreenState extends State<GraphScreen>
     }
   }
 
-  /// Smoothly pans/zooms so [personId]'s node lands centered in the graph viewport.
   Future<void> _centerOnPerson(int personId) async {
     final node = _nodes[personId];
     if (node == null) return;
-    // Use last measured graph size; fallback to screen size
     Size size = _lastGraphSize;
     if (size.isEmpty || size.width == 0) {
       final mq = MediaQuery.maybeOf(context);
       if (mq != null) {
-        size = Size(
-          mq.size.width,
-          mq.size.height - 56 - 84 - mq.padding.top - mq.padding.bottom,
-        );
+        size = Size(mq.size.width, mq.size.height - 56 - 84 - mq.padding.top - mq.padding.bottom);
       } else {
         return;
       }
     }
-    final target = Offset(
-      size.width / 2 - node.pos.dx * _scale,
-      size.height / 2 - node.pos.dy * _scale,
-    );
+    final target = Offset(size.width / 2 - node.pos.dx * _scale, size.height / 2 - node.pos.dy * _scale);
     final start = _canvasOffset;
-    // Briefly highlight by pinning the node during animation
     node.pinned = true;
     final anim = Tween<Offset>(begin: start, end: target).animate(
       CurvedAnimation(parent: _centerController, curve: Curves.easeInOutCubic),
@@ -142,36 +253,36 @@ class _GraphScreenState extends State<GraphScreen>
 
   void _syncNodes(List<Person> persons) {
     final ids = persons.map((p) => p.id!).toSet();
-    // Prune removed + clear their file cache
     final removed = _nodes.keys.where((id) => !ids.contains(id)).toList();
     for (final id in removed) {
       _nodes.remove(id);
       _fileExistsCache.remove(id);
+      _avatarProviderCache.remove(id);
     }
     bool added = false;
     for (final p in persons) {
-      // Cache file existence once per data change, not per frame
       final isAsset = p.imagePath.startsWith('assets/');
       if (!_fileExistsCache.containsKey(p.id)) {
-        _fileExistsCache[p.id!] =
-            !isAsset && p.imagePath.isNotEmpty && File(p.imagePath).existsSync();
+        _fileExistsCache[p.id!] = !isAsset && p.imagePath.isNotEmpty && File(p.imagePath).existsSync();
       } else {
-        // Invalidate if path changed (person mutated)
         final existingNode = _nodes[p.id];
         if (existingNode != null && existingNode.person.imagePath != p.imagePath) {
-          _fileExistsCache[p.id!] =
-              !isAsset && p.imagePath.isNotEmpty && File(p.imagePath).existsSync();
+          _fileExistsCache[p.id!] = !isAsset && p.imagePath.isNotEmpty && File(p.imagePath).existsSync();
+          _avatarProviderCache.remove(p.id);
         }
       }
+      // Pre-cache provider once per data change, not per frame
+      if (_fileExistsCache[p.id] == true && !_avatarProviderCache.containsKey(p.id)) {
+        _avatarProviderCache[p.id!] = ResizeImage(FileImage(File(p.imagePath)), width: 140, height: 140);
+      } else if (isAsset && !_avatarProviderCache.containsKey(p.id)) {
+        _avatarProviderCache[p.id!] = AssetImage(p.imagePath);
+      }
+
       if (!_nodes.containsKey(p.id)) {
         added = true;
         Offset pos;
         if (_pendingAddCanvasPos != null) {
-          pos = _pendingAddCanvasPos! +
-              Offset(
-                (_rng.nextDouble() - 0.5) * 20,
-                (_rng.nextDouble() - 0.5) * 20,
-              );
+          pos = _pendingAddCanvasPos! + Offset((_rng.nextDouble() - 0.5) * 20, (_rng.nextDouble() - 0.5) * 20);
           _pendingAddCanvasPos = null;
         } else {
           final angle = _rng.nextDouble() * 2 * pi;
@@ -180,9 +291,7 @@ class _GraphScreenState extends State<GraphScreen>
         }
         _nodes[p.id!] = _PhysNode(p, pos);
       } else {
-        // Update person reference without losing physics state
         final old = _nodes[p.id!]!;
-        // Only recreate wrapper if person data changed; preserve vel/pinned
         if (old.person != p) {
           _nodes[p.id!] = _PhysNode(p, old.pos)
             ..vel = old.vel
@@ -193,19 +302,24 @@ class _GraphScreenState extends State<GraphScreen>
     if (added) _ensureTickerRunning();
   }
 
+  // Keep sync path for small graphs; async isolate for large graphs
   void _tick([Duration? _]) {
-    if (!mounted) return;
+    if (!mounted || _isComputingIsolate) return;
     if (_nodes.isEmpty) {
       _idleFrames++;
       if (_idleFrames > 90 && _ticker.isActive) _ticker.stop();
       return;
     }
-
     _frameCount++;
-    if (_frameCount % 2 != 0) return; // throttle to ~30fps for physics
+    if (_frameCount % 2 != 0) return;
 
-    // Apply edge attraction inside tick (previously done in build, which caused
-    // state mutation during build and double work per frame).
+    // Large graph -> offload to isolate (threshold 80 nodes, O(n²) > 3200 pairs)
+    if (_nodes.length > 80) {
+      _tickIsolate();
+      return;
+    }
+
+    // --- Main-isolate fast path ---
     for (final rel in _latestRels) {
       final a = _nodes[rel.fromPersonId];
       final b = _nodes[rel.toPersonId];
@@ -218,9 +332,6 @@ class _GraphScreenState extends State<GraphScreen>
       if (!b.pinned) b.vel -= dir * force;
     }
 
-    // Repulsion O(n²) — avoid allocating List copy each tick if possible
-    // _nodes.values is a view; converting to list once is still needed for indexed loop
-    // but we reuse the list reference locally and avoid extra collections.
     final nodes = _nodes.values.toList(growable: false);
     for (int i = 0; i < nodes.length; i++) {
       for (int j = i + 1; j < nodes.length; j++) {
@@ -228,7 +339,6 @@ class _GraphScreenState extends State<GraphScreen>
         final b = nodes[j];
         final delta = a.pos - b.pos;
         final dist2 = delta.distanceSquared;
-        // Clamp dist implicitly via max(1, sqrt) but use distanceSquared for perf
         final dist = dist2 < 1.0 ? 1.0 : sqrt(dist2);
         final force = _repulsion / (dist * dist);
         final dir = delta / dist;
@@ -238,9 +348,7 @@ class _GraphScreenState extends State<GraphScreen>
     }
 
     for (final n in nodes) {
-      if (!n.pinned) {
-        n.vel -= n.pos * _centerGravity;
-      }
+      if (!n.pinned) n.vel -= n.pos * _centerGravity;
     }
 
     double maxVel = 0;
@@ -251,15 +359,10 @@ class _GraphScreenState extends State<GraphScreen>
     }
     if (maxVel < 0.05 && _draggingId == null) {
       _idleFrames++;
-      // Sleep ticker after ~1.5s idle to save battery and avoid constant rebuilds
-      if (_idleFrames > 45 && _ticker.isActive) {
-        _ticker.stop();
-      }
+      if (_idleFrames > 45 && _ticker.isActive) _ticker.stop();
       return;
     }
     _idleFrames = 0;
-
-    // Apply damping + integrate — batched in single setState to avoid intermediate invalidations
     if (mounted) {
       setState(() {
         for (final n in nodes) {
@@ -272,10 +375,47 @@ class _GraphScreenState extends State<GraphScreen>
     }
   }
 
-  Offset _toCanvas(Offset screen) {
-    return (screen - _canvasOffset) / _scale;
+  Future<void> _tickIsolate() async {
+    if (_isComputingIsolate) return;
+    _isComputingIsolate = true;
+    final nodeInputs = _nodes.values
+        .map((n) => _NodeInput(n.person.id!, n.pos.dx, n.pos.dy, n.vel.dx, n.vel.dy, n.pinned))
+        .toList(growable: false);
+    final relInputs = _latestRels.map((r) => _RelInput(r.fromPersonId, r.toPersonId)).toList(growable: false);
+    final input = _PhysicsInput(
+      nodes: nodeInputs,
+      rels: relInputs,
+      repulsion: _repulsion,
+      attraction: _attraction,
+      naturalLen: _naturalLen,
+      damping: _damping,
+      centerGravity: _centerGravity,
+    );
+    try {
+      final outputs = await Isolate.run(() => _computePhysicsInIsolate(input));
+      if (!mounted) return;
+      double maxVel = 0;
+      for (final o in outputs) {
+        final node = _nodes[o.id];
+        if (node == null || node.pinned) continue;
+        node.pos = Offset(o.x, o.y);
+        node.vel = Offset(o.vx, o.vy);
+        final d = node.vel.distance;
+        if (d > maxVel) maxVel = d;
+      }
+      if (maxVel < 0.05 && _draggingId == null) {
+        _idleFrames++;
+        if (_idleFrames > 45 && _ticker.isActive) _ticker.stop();
+      } else {
+        _idleFrames = 0;
+      }
+      if (mounted) setState(() => _paintVersion++);
+    } finally {
+      _isComputingIsolate = false;
+    }
   }
 
+  Offset _toCanvas(Offset screen) => (screen - _canvasOffset) / _scale;
   Offset _toScreen(Offset canvas) => canvas * _scale + _canvasOffset;
 
   _PhysNode? _hitTest(Offset canvasPos) {
@@ -344,14 +484,21 @@ class _GraphScreenState extends State<GraphScreen>
       body: Column(
         children: [
           Expanded(
-            child: Consumer<PersonProvider>(
-              builder: (context, provider, _) {
+            // Selector: rebuild only when persons/rels identity or length changes,
+            // not on every notifyListeners that doesn't affect graph data.
+            child: Selector<PersonProvider, _GraphData>(
+              selector: (_, p) => _GraphData(p.persons, p.relationships),
+              shouldRebuild: (a, b) =>
+                  !identical(a.persons, b.persons) ||
+                  !identical(a.relationships, b.relationships) ||
+                  a.persons.length != b.persons.length ||
+                  a.relationships.length != b.relationships.length,
+              builder: (context, data, _) {
+                final provider = context.read<PersonProvider>();
                 if (kDebugMode) {
-                  debugPrint(
-                    'GraphScreen build: persons=${provider.persons.length} rels=${provider.relationships.length} nodes=${_nodes.length}',
-                  );
+                  debugPrint('GraphScreen build: persons=${data.persons.length} rels=${data.relationships.length} nodes=${_nodes.length}');
                 }
-                if (provider.persons.isEmpty) {
+                if (data.persons.isEmpty) {
                   _latestRels = const [];
                   return Stack(
                     children: [
@@ -367,29 +514,20 @@ class _GraphScreenState extends State<GraphScreen>
                         bottom: 12,
                         child: Text(
                           'Debug: 0 persons (DB empty or seeding failed)\nTry: adb shell pm clear com.example.situationship then rerun',
-                          style: TextStyle(
-                            color: Colors.black.withValues(alpha: 0.5),
-                            fontSize: 10,
-                          ),
+                          style: TextStyle(color: Colors.black.withValues(alpha: 0.5), fontSize: 10),
                         ),
                       ),
                     ],
                   );
                 }
-
-                final needsSync =
-                    provider.persons.any((p) => !_nodes.containsKey(p.id)) ||
-                        _nodes.length != provider.persons.length ||
-                        provider.persons.any((p) => _nodes[p.id]?.person != p);
-                if (needsSync) {
-                  _syncNodes(provider.persons);
-                }
-                // Store latest rels for physics tick — assignment only, no velocity mutation here
-                _latestRels = provider.relationships;
-
+                final needsSync = data.persons.any((p) => !_nodes.containsKey(p.id)) ||
+                    _nodes.length != data.persons.length ||
+                    data.persons.any((p) => _nodes[p.id]?.person != p);
+                if (needsSync) _syncNodes(data.persons);
+                _latestRels = data.relationships;
                 return Stack(
                   children: [
-                    RepaintBoundary(child: _buildInteractiveGraph(provider)),
+                    RepaintBoundary(child: _buildInteractiveGraph(provider, data.relationships)),
                     Positioned(
                       left: 12,
                       bottom: 12,
@@ -401,7 +539,7 @@ class _GraphScreenState extends State<GraphScreen>
                           border: Border.all(color: AppColors.coral.withValues(alpha: 0.3)),
                         ),
                         child: Text(
-                          '${provider.persons.length} persons • ${provider.relationships.length} rels',
+                          '${data.persons.length} persons • ${data.relationships.length} rels',
                           style: const TextStyle(color: Colors.black54, fontSize: 10),
                         ),
                       ),
@@ -418,12 +556,11 @@ class _GraphScreenState extends State<GraphScreen>
     );
   }
 
-  Widget _buildInteractiveGraph(PersonProvider provider) {
+  Widget _buildInteractiveGraph(PersonProvider provider, List<Relationship> rels) {
     return LayoutBuilder(
       builder: (context, constraints) {
         _lastGraphSize = Size(constraints.maxWidth, constraints.maxHeight);
         if (!_didInitOffset && _canvasOffset == Offset.zero && constraints.maxWidth > 0) {
-          // One-time centering without triggering an extra rebuild loop.
           _canvasOffset = Offset(constraints.maxWidth / 2, constraints.maxHeight / 2);
           _didInitOffset = true;
         }
@@ -435,7 +572,6 @@ class _GraphScreenState extends State<GraphScreen>
             _didDrag = false;
             _ensureTickerRunning();
             if (_tapAddPos != null) setState(() => _tapAddPos = null);
-
             final canvasPos = _toCanvas(details.localFocalPoint);
             final hit = _hitTest(canvasPos);
             if (hit != null) {
@@ -469,9 +605,7 @@ class _GraphScreenState extends State<GraphScreen>
               _nodes[_draggingId!]?.pinned = false;
               _ensureTickerRunning();
             }
-            Future.delayed(const Duration(milliseconds: 150), () {
-              _didDrag = false;
-            });
+            Future.delayed(const Duration(milliseconds: 150), () => _didDrag = false);
             _draggingId = null;
           },
           onTapUp: (details) {
@@ -495,8 +629,7 @@ class _GraphScreenState extends State<GraphScreen>
               });
               Future.delayed(const Duration(seconds: 4), () {
                 if (!mounted) return;
-                if (_tapAddTime != null &&
-                    DateTime.now().difference(_tapAddTime!).inSeconds >= 4) {
+                if (_tapAddTime != null && DateTime.now().difference(_tapAddTime!).inSeconds >= 4) {
                   setState(() => _tapAddPos = null);
                 }
               });
@@ -504,12 +637,11 @@ class _GraphScreenState extends State<GraphScreen>
           },
           child: Stack(
             children: [
-              // Edges behind nodes — isolated repaint
               RepaintBoundary(
                 child: CustomPaint(
                   painter: _EdgePainter(
                     nodes: _nodes,
-                    relationships: provider.relationships,
+                    relationships: rels,
                     canvasOffset: _canvasOffset,
                     scale: _scale,
                     nodeRadius: _nodeRadius,
@@ -518,31 +650,23 @@ class _GraphScreenState extends State<GraphScreen>
                   child: const SizedBox.expand(),
                 ),
               ),
-              // Nodes — each avatar isolated with RepaintBoundary to avoid full-stack repaint on decodes
               ..._nodes.values.map((node) {
                 final center = _toScreen(node.pos);
                 final r = _nodeRadius * _scale;
-                final isAsset = node.person.imagePath.startsWith('assets/');
                 final fileExists = _fileExistsCache[node.person.id] ?? false;
-
+                final isAsset = node.person.imagePath.startsWith('assets/');
                 Widget avatar;
                 if (isAsset) {
                   avatar = CircleAvatar(
                     radius: r,
-                    backgroundImage: AssetImage(node.person.imagePath),
+                    backgroundImage: _avatarProviderCache[node.person.id] ?? AssetImage(node.person.imagePath),
                     backgroundColor: Colors.white,
                     onBackgroundImageError: (_, _) {},
                   );
                 } else if (fileExists) {
-                  // Use ResizeImage to decode at ~2x display size, not full file resolution.
-                  final targetPx = (r * 2 * MediaQuery.devicePixelRatioOf(context)).round().clamp(48, 256);
                   avatar = CircleAvatar(
                     radius: r,
-                    backgroundImage: ResizeImage(
-                      FileImage(File(node.person.imagePath)),
-                      width: targetPx,
-                      height: targetPx,
-                    ),
+                    backgroundImage: _avatarProviderCache[node.person.id]!,
                     backgroundColor: Colors.white,
                     onBackgroundImageError: (_, _) {},
                   );
@@ -551,17 +675,9 @@ class _GraphScreenState extends State<GraphScreen>
                   avatar = CircleAvatar(
                     radius: r,
                     backgroundColor: Colors.white,
-                    child: Text(
-                      initial,
-                      style: TextStyle(
-                        color: AppColors.vividRed,
-                        fontWeight: FontWeight.bold,
-                        fontSize: r * 0.7,
-                      ),
-                    ),
+                    child: Text(initial, style: TextStyle(color: AppColors.vividRed, fontWeight: FontWeight.bold, fontSize: r * 0.7)),
                   );
                 }
-
                 return Positioned(
                   left: center.dx - r,
                   top: center.dy - r,
@@ -569,41 +685,28 @@ class _GraphScreenState extends State<GraphScreen>
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
+                        // Reduced shadow blur: 4 instead of 6, cheaper raster
                         Container(
-                          decoration: BoxDecoration(
+                          decoration: const BoxDecoration(
                             shape: BoxShape.circle,
-                            border: Border.all(color: Colors.white, width: 2),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withValues(alpha: 0.12),
-                                blurRadius: 6,
-                                offset: const Offset(0, 2),
-                              ),
-                            ],
+                            color: Colors.white,
+                            border: Border.fromBorderSide(BorderSide(color: _avatarBorder, width: 2)),
+                            boxShadow: [_avatarShadow],
                           ),
                           child: avatar,
                         ),
                         const SizedBox(height: 4),
                         Container(
                           padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.95),
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: AppColors.coral.withValues(alpha: 0.2)),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withValues(alpha: 0.06),
-                                blurRadius: 4,
-                              ),
-                            ],
+                          decoration: const BoxDecoration(
+                            color: Color(0xF2FFFFFF), // 95%
+                            borderRadius: BorderRadius.all(Radius.circular(8)),
+                            border: Border.fromBorderSide(BorderSide(color: Color(0x33FF655B))),
+                            boxShadow: [_labelShadow],
                           ),
                           child: Text(
                             node.person.name.split(' ').first,
-                            style: TextStyle(
-                              color: Colors.black87,
-                              fontSize: (10 * _scale).clamp(8.0, 11.0),
-                              fontWeight: FontWeight.w600,
-                            ),
+                            style: TextStyle(color: Colors.black87, fontSize: (10 * _scale).clamp(8.0, 11.0), fontWeight: FontWeight.w600),
                           ),
                         ),
                       ],
@@ -623,10 +726,7 @@ class _GraphScreenState extends State<GraphScreen>
                       onTap: () {
                         _pendingAddCanvasPos = _toCanvas(_tapAddPos!);
                         setState(() => _tapAddPos = null);
-                        Navigator.push(
-                          context,
-                          MaterialPageRoute(builder: (_) => const AddNodeWizardScreen()),
-                        );
+                        Navigator.push(context, MaterialPageRoute(builder: (_) => const AddNodeWizardScreen()));
                       },
                       child: Container(
                         width: 48,
@@ -635,13 +735,7 @@ class _GraphScreenState extends State<GraphScreen>
                           color: AppColors.coral,
                           shape: BoxShape.circle,
                           border: Border.all(color: Colors.white, width: 2),
-                          boxShadow: [
-                            BoxShadow(
-                              color: Colors.black.withValues(alpha: 0.2),
-                              blurRadius: 8,
-                              offset: const Offset(0, 3),
-                            ),
-                          ],
+                          boxShadow: const [BoxShadow(color: Color(0x33000000), blurRadius: 8, offset: Offset(0, 3))],
                         ),
                         child: const Icon(Icons.add, color: Colors.white, size: 24),
                       ),
@@ -656,6 +750,13 @@ class _GraphScreenState extends State<GraphScreen>
   }
 }
 
+// Lightweight view for Selector
+class _GraphData {
+  final List<Person> persons;
+  final List<Relationship> relationships;
+  const _GraphData(this.persons, this.relationships);
+}
+
 class _EdgePainter extends CustomPainter {
   final Map<int, _PhysNode> nodes;
   final List<Relationship> relationships;
@@ -663,6 +764,32 @@ class _EdgePainter extends CustomPainter {
   final double scale;
   final double nodeRadius;
   final int version;
+
+  // LRU-ish label cache: key = "label|mutual|bucket"
+  static final Map<String, TextPainter> _labelCache = {};
+  static const int _maxCache = 64;
+
+  // Hoisted paints — no `withValues` per edge
+  static const Color _mutualEdge = Color(0xE6FF1E25); // 90%
+  static const Color _normalEdge = Color(0xBF000000); // 75%
+  static const Color _bgWhite = Color(0xEBFFFFFF); // 92%
+  static const Color _borderMutual = Color(0x33FF1E25);
+  static const Color _borderNormal = Color(0x33000000);
+  static final Paint _bgPaint = Paint()..color = _bgWhite;
+  static final Paint _borderMutualPaint = Paint()
+    ..color = _borderMutual
+    ..style = PaintingStyle.stroke
+    ..strokeWidth = 0.8;
+  static final Paint _borderNormalPaint = Paint()
+    ..color = _borderNormal
+    ..style = PaintingStyle.stroke
+    ..strokeWidth = 0.8;
+  static final Paint _arrowMutual = Paint()
+    ..color = AppColors.vividRed
+    ..style = PaintingStyle.fill;
+  static final Paint _arrowNormal = Paint()
+    ..color = _normalEdge
+    ..style = PaintingStyle.fill;
 
   _EdgePainter({
     required this.nodes,
@@ -675,133 +802,11 @@ class _EdgePainter extends CustomPainter {
 
   Offset _toScreen(Offset canvas) => canvas * scale + canvasOffset;
 
-  @override
-  void paint(Canvas canvas, Size size) {
-    // Cheap culling: skip edges fully offscreen (expanded by label bg + arrow)
-    final margin = 80 * scale;
-
-    // Reuse paints — avoid allocating per edge per frame
-    final bgPaint = Paint()..color = Colors.white.withValues(alpha: 0.92);
-    final bgBorderMutual = Paint()
-      ..color = AppColors.vividRed.withValues(alpha: 0.2)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 0.8;
-    final bgBorderNormal = Paint()
-      ..color = Colors.black12.withValues(alpha: 0.2)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 0.8;
-
-    for (final rel in relationships) {
-      final a = nodes[rel.fromPersonId];
-      final b = nodes[rel.toPersonId];
-      if (a == null || b == null) continue;
-
-      final from = _toScreen(a.pos);
-      final to = _toScreen(b.pos);
-
-      // Frustum cull: if both endpoints offscreen on same side, skip paint + label
-      if ((from.dx < -margin && to.dx < -margin) ||
-          (from.dx > size.width + margin && to.dx > size.width + margin) ||
-          (from.dy < -margin && to.dy < -margin) ||
-          (from.dy > size.height + margin && to.dy > size.height + margin)) {
-        continue;
-      }
-
-      final dirVec = to - from;
-      final len = dirVec.distance;
-      if (len < 1) continue;
-      final dirUnit = dirVec / len;
-      final edgeGap = nodeRadius * scale + 14;
-      final lineFrom = from + dirUnit * edgeGap;
-      final lineTo = to - dirUnit * edgeGap;
-
-      if ((lineTo - lineFrom).distance >= 1) {
-        final edgePaint = Paint()
-          ..color = rel.isMutual
-              ? AppColors.vividRed.withValues(alpha: 0.9)
-              : Colors.black.withValues(alpha: 0.75)
-          ..strokeWidth = (rel.isMutual ? 1.6 : 1.0) * scale
-          ..style = PaintingStyle.stroke;
-        canvas.drawLine(lineFrom, lineTo, edgePaint);
-      }
-      _drawArrow(canvas, from, to, rel.isMutual);
-      _drawEdgeLabel(canvas, from, to, rel.label, rel.isMutual, bgPaint,
-          rel.isMutual ? bgBorderMutual : bgBorderNormal);
-    }
-  }
-
-  void _drawArrow(Canvas canvas, Offset from, Offset to, bool mutual) {
-    final dir = to - from;
-    final len = dir.distance;
-    if (len < 1) return;
-    final unit = dir / len;
-    final tipOffset = nodeRadius * scale + 14;
-    final tip = to - unit * tipOffset;
-
-    const arrowLen = 7.0;
-    const arrowAngle = 0.5;
-    final left = Offset(
-      tip.dx - arrowLen * (unit.dx * cos(arrowAngle) - unit.dy * sin(arrowAngle)),
-      tip.dy - arrowLen * (unit.dy * cos(arrowAngle) + unit.dx * sin(arrowAngle)),
-    );
-    final right = Offset(
-      tip.dx - arrowLen * (unit.dx * cos(-arrowAngle) - unit.dy * sin(-arrowAngle)),
-      tip.dy - arrowLen * (unit.dy * cos(-arrowAngle) + unit.dx * sin(-arrowAngle)),
-    );
-
-    final arrowPath = Path()
-      ..moveTo(tip.dx, tip.dy)
-      ..lineTo(left.dx, left.dy)
-      ..lineTo(right.dx, right.dy)
-      ..close();
-
-    canvas.drawPath(
-      arrowPath,
-      Paint()
-        ..color = mutual ? AppColors.vividRed : Colors.black.withValues(alpha: 0.75)
-        ..style = PaintingStyle.fill,
-    );
-
-    if (mutual) {
-      final fromUnit = -unit;
-      final fromTip = from - fromUnit * (-(nodeRadius * scale + 14));
-      final fromLeft = Offset(
-        fromTip.dx -
-            arrowLen * (fromUnit.dx * cos(arrowAngle) - fromUnit.dy * sin(arrowAngle)),
-        fromTip.dy -
-            arrowLen * (fromUnit.dy * cos(arrowAngle) + fromUnit.dx * sin(arrowAngle)),
-      );
-      final fromRight = Offset(
-        fromTip.dx -
-            arrowLen * (fromUnit.dx * cos(-arrowAngle) - fromUnit.dy * sin(-arrowAngle)),
-        fromTip.dy -
-            arrowLen * (fromUnit.dy * cos(-arrowAngle) + fromUnit.dx * sin(-arrowAngle)),
-      );
-      final fromArrow = Path()
-        ..moveTo(fromTip.dx, fromTip.dy)
-        ..lineTo(fromLeft.dx, fromLeft.dy)
-        ..lineTo(fromRight.dx, fromRight.dy)
-        ..close();
-      canvas.drawPath(
-        fromArrow,
-        Paint()
-          ..color = AppColors.vividRed
-          ..style = PaintingStyle.fill,
-      );
-    }
-  }
-
-  void _drawEdgeLabel(
-    Canvas canvas,
-    Offset from,
-    Offset to,
-    String label,
-    bool mutual,
-    Paint bg,
-    Paint border,
-  ) {
-    if (label.isEmpty) return;
-    final mid = (from + to) / 2;
+  TextPainter _cachedLabel(String label, bool mutual, double scale) {
+    final bucket = (scale * 10).round(); // 0.1 granularity
+    final key = '$label|$mutual|$bucket';
+    final hit = _labelCache[key];
+    if (hit != null) return hit;
     final tp = TextPainter(
       text: TextSpan(
         text: label,
@@ -814,17 +819,93 @@ class _EdgePainter extends CustomPainter {
       ),
       textDirection: TextDirection.ltr,
     )..layout();
+    if (_labelCache.length >= _maxCache) _labelCache.remove(_labelCache.keys.first);
+    _labelCache[key] = tp;
+    return tp;
+  }
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final margin = 80 * scale;
+    for (final rel in relationships) {
+      final a = nodes[rel.fromPersonId];
+      final b = nodes[rel.toPersonId];
+      if (a == null || b == null) continue;
+      final from = _toScreen(a.pos);
+      final to = _toScreen(b.pos);
+      if ((from.dx < -margin && to.dx < -margin) ||
+          (from.dx > size.width + margin && to.dx > size.width + margin) ||
+          (from.dy < -margin && to.dy < -margin) ||
+          (from.dy > size.height + margin && to.dy > size.height + margin)) {
+        continue;
+      }
+      final dirVec = to - from;
+      final len = dirVec.distance;
+      if (len < 1) continue;
+      final dirUnit = dirVec / len;
+      final edgeGap = nodeRadius * scale + 14;
+      final lineFrom = from + dirUnit * edgeGap;
+      final lineTo = to - dirUnit * edgeGap;
+      if ((lineTo - lineFrom).distance >= 1) {
+        final edgePaint = Paint()
+          ..color = rel.isMutual ? _mutualEdge : _normalEdge
+          ..strokeWidth = (rel.isMutual ? 1.6 : 1.0) * scale
+          ..style = PaintingStyle.stroke;
+        canvas.drawLine(lineFrom, lineTo, edgePaint);
+      }
+      _drawArrow(canvas, from, to, rel.isMutual);
+      _drawEdgeLabel(canvas, from, to, rel.label, rel.isMutual);
+    }
+  }
+
+  void _drawArrow(Canvas canvas, Offset from, Offset to, bool mutual) {
+    final dir = to - from;
+    final len = dir.distance;
+    if (len < 1) return;
+    final unit = dir / len;
+    final tipOffset = nodeRadius * scale + 14;
+    final tip = to - unit * tipOffset;
+    const arrowLen = 7.0;
+    const arrowAngle = 0.5;
+    final left = Offset(tip.dx - arrowLen * (unit.dx * cos(arrowAngle) - unit.dy * sin(arrowAngle)),
+        tip.dy - arrowLen * (unit.dy * cos(arrowAngle) + unit.dx * sin(arrowAngle)));
+    final right = Offset(tip.dx - arrowLen * (unit.dx * cos(-arrowAngle) - unit.dy * sin(-arrowAngle)),
+        tip.dy - arrowLen * (unit.dy * cos(-arrowAngle) + unit.dx * sin(-arrowAngle)));
+    final arrowPath = Path()
+      ..moveTo(tip.dx, tip.dy)
+      ..lineTo(left.dx, left.dy)
+      ..lineTo(right.dx, right.dy)
+      ..close();
+    canvas.drawPath(arrowPath, mutual ? _arrowMutual : _arrowNormal);
+    if (mutual) {
+      final fromUnit = -unit;
+      final fromTip = from - fromUnit * (-(nodeRadius * scale + 14));
+      final fromLeft = Offset(fromTip.dx - arrowLen * (fromUnit.dx * cos(arrowAngle) - fromUnit.dy * sin(arrowAngle)),
+          fromTip.dy - arrowLen * (fromUnit.dy * cos(arrowAngle) + fromUnit.dx * sin(arrowAngle)));
+      final fromRight = Offset(fromTip.dx - arrowLen * (fromUnit.dx * cos(-arrowAngle) - fromUnit.dy * sin(-arrowAngle)),
+          fromTip.dy - arrowLen * (fromUnit.dy * cos(-arrowAngle) + fromUnit.dx * sin(-arrowAngle)));
+      final fromArrow = Path()
+        ..moveTo(fromTip.dx, fromTip.dy)
+        ..lineTo(fromLeft.dx, fromLeft.dy)
+        ..lineTo(fromRight.dx, fromRight.dy)
+        ..close();
+      canvas.drawPath(fromArrow, _arrowMutual);
+    }
+  }
+
+  void _drawEdgeLabel(Canvas canvas, Offset from, Offset to, String label, bool mutual) {
+    if (label.isEmpty) return;
+    final mid = (from + to) / 2;
+    final tp = _cachedLabel(label, mutual, scale);
     final bgRect = Rect.fromCenter(center: mid, width: tp.width + 8, height: tp.height + 4);
     final rrect = RRect.fromRectAndRadius(bgRect, const Radius.circular(6));
-    canvas.drawRRect(rrect, bg);
-    canvas.drawRRect(rrect, border);
+    canvas.drawRRect(rrect, _bgPaint);
+    canvas.drawRRect(rrect, mutual ? _borderMutualPaint : _borderNormalPaint);
     tp.paint(canvas, mid - Offset(tp.width / 2, tp.height / 2));
   }
 
   @override
   bool shouldRepaint(covariant _EdgePainter old) {
-    // Version bump on every physics move ensures repaint only when needed;
-    // also repaint on pan/zoom or relationship change.
     return version != old.version ||
         canvasOffset != old.canvasOffset ||
         scale != old.scale ||

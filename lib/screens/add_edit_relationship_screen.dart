@@ -55,7 +55,12 @@ class _AddEditRelationshipScreenState extends State<AddEditRelationshipScreen> {
   }
 
   Future<void> _pickImage() async {
-    final XFile? picked = await _picker.pickImage(source: ImageSource.gallery);
+    final XFile? picked = await _picker.pickImage(
+      source: ImageSource.gallery,
+      maxWidth: 1280,
+      maxHeight: 1280,
+      imageQuality: 85,
+    );
     if (picked != null) {
       setState(() => _imagePaths.add(picked.path));
     }
@@ -166,7 +171,7 @@ class _AddEditRelationshipScreenState extends State<AddEditRelationshipScreen> {
               decoration: BoxDecoration(
                 borderRadius: BorderRadius.circular(8),
                 image: DecorationImage(
-                  image: FileImage(File(path)),
+                  image: ResizeImage(FileImage(File(path)), width: 160, height: 160),
                   fit: BoxFit.cover,
                   onError: (_, _) {},
                 ),

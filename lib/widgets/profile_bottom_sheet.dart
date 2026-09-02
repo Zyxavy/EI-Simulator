@@ -176,7 +176,12 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
   }
 
   Future<void> _pickEditImage() async {
-    final XFile? p = await _editPicker.pickImage(source: ImageSource.gallery);
+    final XFile? p = await _editPicker.pickImage(
+      source: ImageSource.gallery,
+      maxWidth: 1024,
+      maxHeight: 1024,
+      imageQuality: 85,
+    );
     if (p != null) setState(() => _editImagePath = p.path);
   }
 
@@ -614,7 +619,12 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
       );
       return;
     }
-    final XFile? picked = await _editPicker.pickImage(source: ImageSource.gallery);
+    final XFile? picked = await _editPicker.pickImage(
+      source: ImageSource.gallery,
+      maxWidth: 1280,
+      maxHeight: 1280,
+      imageQuality: 85,
+    );
     if (picked == null) return;
     final targetRelId = _relationships.first.id!;
     await DbHelper.instance.insertRelationshipImage(

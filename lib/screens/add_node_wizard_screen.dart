@@ -70,14 +70,24 @@ class _AddNodeWizardScreenState extends State<AddNodeWizardScreen> {
   }
 
   Future<void> _pickProfileImage() async {
-    final XFile? picked = await _picker.pickImage(source: ImageSource.gallery);
+    final XFile? picked = await _picker.pickImage(
+      source: ImageSource.gallery,
+      maxWidth: 1024,
+      maxHeight: 1024,
+      imageQuality: 85,
+    );
     if (picked != null) {
       setState(() => _profileImagePath = picked.path);
     }
   }
 
   Future<void> _pickPhoto() async {
-    final XFile? picked = await _picker.pickImage(source: ImageSource.gallery);
+    final XFile? picked = await _picker.pickImage(
+      source: ImageSource.gallery,
+      maxWidth: 1280,
+      maxHeight: 1280,
+      imageQuality: 85,
+    );
     if (picked != null) {
       setState(() => _photoPaths.add(picked.path));
     }
@@ -337,7 +347,8 @@ class _AddNodeWizardScreenState extends State<AddNodeWizardScreen> {
               alignment: Alignment.bottomRight,
               children: [
                 _profileImagePath != null && File(_profileImagePath!).existsSync()
-                    ? CircleAvatar(radius: 36, backgroundImage: FileImage(File(_profileImagePath!)))
+                    ? CircleAvatar(
+                        radius: 36, backgroundImage: ResizeImage(FileImage(File(_profileImagePath!)), width: 144, height: 144))
                     : _profileImagePath != null && _profileImagePath!.startsWith('assets/')
                         ? CircleAvatar(radius: 36, backgroundImage: AssetImage(_profileImagePath!), backgroundColor: Colors.white)
                         : Container(
@@ -688,7 +699,8 @@ class _AddNodeWizardScreenState extends State<AddNodeWizardScreen> {
                           margin: const EdgeInsets.only(right: 8),
                           decoration: BoxDecoration(
                             borderRadius: BorderRadius.circular(8),
-                            image: DecorationImage(image: FileImage(File(path)), fit: BoxFit.cover),
+                            image: DecorationImage(
+                                image: ResizeImage(FileImage(File(path)), width: 160, height: 160), fit: BoxFit.cover),
                             border: Border.all(color: Colors.white, width: 1),
                           ),
                           child: const Align(
