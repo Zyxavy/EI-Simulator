@@ -210,8 +210,10 @@ class _GraphScreenState extends State<GraphScreen>
   Offset _toScreen(Offset canvas) => canvas * _scale + _canvasOffset;
 
   _PhysNode? _hitTest(Offset canvasPos) {
+    // Slightly larger hit radius (avatar + white border + shadow) for forgiving drag
+    const hitPadding = 8.0;
     for (final n in _nodes.values) {
-      if ((n.pos - canvasPos).distance < _nodeRadius) return n;
+      if ((n.pos - canvasPos).distance < _nodeRadius + hitPadding) return n;
     }
     return null;
   }
@@ -357,14 +359,14 @@ class _GraphScreenState extends State<GraphScreen>
       }
       return GestureDetector(
         onScaleStart: (details) {
-          _focalPointStart = details.focalPoint;
+          _focalPointStart = details.localFocalPoint;
           _canvasOffsetStart = _canvasOffset;
           _scaleStart = _scale;
           _didDrag = false;
           // Any pan/zoom or drag hides contextual add button
           if (_tapAddPos != null) setState(() => _tapAddPos = null);
 
-          final canvasPos = _toCanvas(details.focalPoint);
+          final canvasPos = _toCanvas(details.localFocalPoint);
           final hit = _hitTest(canvasPos);
           if (hit != null) {
             _draggingId = hit.person.id;
@@ -376,7 +378,7 @@ class _GraphScreenState extends State<GraphScreen>
           if (_draggingId != null && details.pointerCount == 1) {
             final node = _nodes[_draggingId!];
             if (node != null) {
-              final canvasPos = _toCanvas(details.focalPoint);
+              final canvasPos = _toCanvas(details.localFocalPoint);
               _didDrag = true;
               setState(() {
                 node.pos = canvasPos - _dragLocalStart;
@@ -385,10 +387,10 @@ class _GraphScreenState extends State<GraphScreen>
             }
           } else if (_draggingId == null) {
             // Pan threshold to distinguish tap vs drag
-            if ((details.focalPoint - _focalPointStart).distance > 6) _didDrag = true;
+            if ((details.localFocalPoint - _focalPointStart).distance > 6) _didDrag = true;
             setState(() {
               _scale = (_scaleStart * details.scale).clamp(0.2, 3.0);
-              _canvasOffset = _canvasOffsetStart + (details.focalPoint - _focalPointStart);
+              _canvasOffset = _canvasOffsetStart + (details.localFocalPoint - _focalPointStart);
             });
           }
         },
