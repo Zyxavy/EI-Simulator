@@ -3,6 +3,7 @@ import 'package:ei_simulator/providers/person_provider.dart';
 import 'package:ei_simulator/screens/add_edit_person_screen.dart';
 import 'package:ei_simulator/screens/graph_screen.dart';
 import 'package:ei_simulator/screens/search_screen.dart';
+import 'package:ei_simulator/theme/app_theme.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -24,6 +25,7 @@ class MainApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
+      theme: AppTheme.light,
       initialRoute: '/',
       routes: {
         '/': (context) => const GraphScreen(),

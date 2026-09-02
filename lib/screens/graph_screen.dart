@@ -31,6 +31,7 @@ class _GraphScreenState extends State<GraphScreen>
   final Map<int, _PhysNode> _nodes = {};
   late AnimationController _ticker;
   final Random _rng = Random();
+  int _frameCount = 0;
 
   // Pan + zoom state
   Offset _canvasOffset = Offset.zero;
@@ -58,6 +59,10 @@ class _GraphScreenState extends State<GraphScreen>
       duration: const Duration(days: 1),
     )..addListener(_tick);
     _ticker.forward();
+    // Defer first sync until first frame to avoid Width is zero jank
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) setState(() {});
+    });
   }
 
   @override
@@ -90,6 +95,10 @@ class _GraphScreenState extends State<GraphScreen>
     final nodes = _nodes.values.toList();
     if (nodes.isEmpty) return;
 
+    // Throttle: only tick every 2 frames to reduce Skipped frames on emulator
+    _frameCount++;
+    if (_frameCount % 2 != 0) return;
+
     // Repulsion between all pairs
     for (int i = 0; i < nodes.length; i++) {
       for (int j = i + 1; j < nodes.length; j++) {
@@ -111,13 +120,23 @@ class _GraphScreenState extends State<GraphScreen>
       }
     }
 
-    setState(() {
-      for (final n in nodes) {
-        if (n.pinned) continue;
-        n.vel *= _damping;
-        n.pos += n.vel;
-      }
-    });
+    // Only rebuild if movement is meaningful (avoid blank-screen jank when settled)
+    double maxVel = 0;
+    for (final n in nodes) {
+      if (n.pinned) continue;
+      maxVel = maxVel > n.vel.distance ? maxVel : n.vel.distance;
+    }
+    if (maxVel < 0.05 && _draggingId == null) return;
+
+    if (mounted) {
+      setState(() {
+        for (final n in nodes) {
+          if (n.pinned) continue;
+          n.vel *= _damping;
+          n.pos += n.vel;
+        }
+      });
+    }
   }
 
   void _applyEdgeForces(List<Relationship> rels) {
@@ -165,20 +184,59 @@ class _GraphScreenState extends State<GraphScreen>
       ),
       body: Consumer<PersonProvider>(
         builder: (context, provider, _) {
+          // Diagnostic overlay: always show count even when empty to avoid "blank" perception
+          debugPrint('GraphScreen build: persons=${provider.persons.length} rels=${provider.relationships.length} nodes=${_nodes.length}');
           if (provider.persons.isEmpty) {
-            return const Center(
-              child: Text(
-                'No one here yet.\nAdd someone with the + button.',
-                textAlign: TextAlign.center,
-                style: TextStyle(color: Colors.white38),
-              ),
+            return Stack(
+              children: [
+                const Center(
+                  child: Text(
+                    'No one here yet.\nAdd someone with the + button.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.white38),
+                  ),
+                ),
+                Positioned(
+                  left: 12,
+                  bottom: 12,
+                  child: Text(
+                    'Debug: 0 persons (DB empty or seeding failed)\nTry: adb shell pm clear com.example.ei_simulator then rerun',
+                    style: TextStyle(color: Colors.white.withValues(alpha: 0.5), fontSize: 10),
+                  ),
+                ),
+              ],
             );
           }
 
-          _syncNodes(provider.persons);
+          // Avoid mutating during build causing loop — schedule sync if needed
+          final needsSync = provider.persons.any((p) => !_nodes.containsKey(p.id)) ||
+              _nodes.length != provider.persons.length;
+          if (needsSync) {
+            // Sync synchronously for now but throttle: only if ids mismatch
+            _syncNodes(provider.persons);
+          }
           _applyEdgeForces(provider.relationships);
 
-          return _buildInteractiveGraph(provider);
+          return Stack(
+            children: [
+              RepaintBoundary(child: _buildInteractiveGraph(provider)),
+              Positioned(
+                left: 12,
+                bottom: 12,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.5),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    '${provider.persons.length} persons • ${provider.relationships.length} rels',
+                    style: const TextStyle(color: Colors.white70, fontSize: 10),
+                  ),
+                ),
+              ),
+            ],
+          );
         },
       ),
       floatingActionButton: FloatingActionButton(
@@ -193,7 +251,12 @@ class _GraphScreenState extends State<GraphScreen>
   }
 
   Widget _buildInteractiveGraph(PersonProvider provider) {
-    return GestureDetector(
+    return LayoutBuilder(builder: (context, constraints) {
+      // Center graph in available space on first layout to avoid Width is zero drift
+      if (_canvasOffset == Offset.zero && constraints.maxWidth > 0) {
+        _canvasOffset = Offset(constraints.maxWidth / 2, constraints.maxHeight / 2);
+      }
+      return GestureDetector(
       onScaleStart: (details) {
         _focalPointStart = details.focalPoint;
         _canvasOffsetStart = _canvasOffset;
@@ -257,7 +320,8 @@ class _GraphScreenState extends State<GraphScreen>
         ),
         child: const SizedBox.expand(),
       ),
-    );
+      );
+    });
   }
 }
 
