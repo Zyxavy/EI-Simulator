@@ -642,17 +642,25 @@ class _AddNodeWizardScreenState extends State<AddNodeWizardScreen> {
             border: Border.all(color: Colors.black, width: 0.9),
             borderRadius: BorderRadius.circular(2),
           ),
-          child: _photoPaths.isEmpty
-              ? SizedBox(
-                  height: 80,
-                  child: Center(
-                    child: Text('No photos yet, tap + to add',
-                        style: TextStyle(color: Colors.black.withValues(alpha: 0.4), fontSize: 11)),
-                  ),
-                )
-              : SizedBox(
-                  height: 80,
-                  child: ListView.builder(
+          child: SizedBox(
+            height: 80,
+            child: _photoPaths.isEmpty
+                ? Center(
+                    child: GestureDetector(
+                      onTap: _pickPhoto,
+                      child: Container(
+                        width: 80,
+                        height: 80,
+                        decoration: BoxDecoration(
+                          color: AppColors.bgLight,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.black26),
+                        ),
+                        child: const Icon(Icons.add_a_photo, color: Colors.black38),
+                      ),
+                    ),
+                  )
+                : ListView.builder(
                     scrollDirection: Axis.horizontal,
                     itemCount: _photoPaths.length + 1,
                     itemBuilder: (context, index) {
@@ -691,7 +699,7 @@ class _AddNodeWizardScreenState extends State<AddNodeWizardScreen> {
                       );
                     },
                   ),
-                ),
+          ),
         ),
         const SizedBox(height: 8),
         Text('These photos will be attached to the first relationship. Tap photo to remove.',

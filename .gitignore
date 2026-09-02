@@ -10,6 +10,8 @@
 .history
 .svn/
 .swiftpm/
+.agents
+skills-lock.json
 migrate_working_dir/
 docs/TODOs.md
 docs/implementation-plan.md

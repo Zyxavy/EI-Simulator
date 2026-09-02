@@ -54,4 +54,21 @@ class Person {
       createdAt: createdAt ?? this.createdAt,
     );
   }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    if (other is! Person) return false;
+    // If both have non-null ids, equality is by id (DB identity)
+    if (id != null && other.id != null) return id == other.id;
+    // Fallback to field equality for transient (unsaved) persons
+    return name == other.name &&
+        description == other.description &&
+        personality == other.personality &&
+        imagePath == other.imagePath &&
+        createdAt == other.createdAt;
+  }
+
+  @override
+  int get hashCode => id != null ? id.hashCode : Object.hash(name, description, personality, imagePath, createdAt);
 }

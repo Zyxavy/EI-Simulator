@@ -11,7 +11,6 @@ import 'package:image_picker/image_picker.dart';
 
 import '../providers/person_provider.dart';
 import '../theme/app_colors.dart';
-import '../screens/add_edit_relationship_screen.dart';
 
 Future<void> showProfileBottomSheet(BuildContext context, Person person) {
   return showModalBottomSheet(
@@ -312,7 +311,154 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
     );
   }
 
+  Future<void> _showAddRelationshipInEdit() async {
+    final provider = Provider.of<PersonProvider>(context, listen: false);
+    final persons = provider.persons.where((p) => p.id != _person.id).toList();
+    if (persons.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No other people to relate to yet')));
+      return;
+    }
+    Person? selectedTo;
+    final labelController = TextEditingController();
+    final result = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.bgLight,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('Add Relationship', style: TextStyle(color: Color(0xFF2B0000), fontWeight: FontWeight.bold, fontSize: 16)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            DropdownButtonFormField<Person>(
+              dropdownColor: Colors.white,
+              decoration: InputDecoration(
+                labelText: 'To',
+                labelStyle: const TextStyle(color: Colors.black54),
+                enabledBorder: OutlineInputBorder(borderSide: const BorderSide(color: Colors.black54), borderRadius: BorderRadius.all(Radius.circular(8))),
+                focusedBorder: const OutlineInputBorder(borderSide: BorderSide(color: AppColors.coral), borderRadius: BorderRadius.all(Radius.circular(8))),
+              ),
+              items: persons.map((p) => DropdownMenuItem(value: p, child: Text(p.name, style: const TextStyle(color: Colors.black87)))).toList(),
+              onChanged: (v) => selectedTo = v,
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: labelController,
+              decoration: InputDecoration(
+                labelText: 'Label (Crush, Ex, Situationship)',
+                labelStyle: const TextStyle(color: Colors.black54, fontSize: 12),
+                enabledBorder: OutlineInputBorder(borderSide: const BorderSide(color: Colors.black54), borderRadius: BorderRadius.circular(8)),
+                focusedBorder: OutlineInputBorder(borderSide: const BorderSide(color: AppColors.coral), borderRadius: BorderRadius.circular(8)),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel', style: TextStyle(color: Colors.black54))),
+          TextButton(
+            onPressed: () {
+              if (selectedTo == null || labelController.text.trim().isEmpty) {
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Select person and label')));
+                return;
+              }
+              Navigator.pop(ctx, {'to': selectedTo, 'label': labelController.text.trim()});
+            },
+            child: const Text('Add', style: TextStyle(color: AppColors.vividRed, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+    if (result != null) {
+      final toPerson = result['to'] as Person;
+      final label = result['label'] as String;
+      final now = DateTime.now().toIso8601String();
+      final rel = Relationship(fromPersonId: _person.id!, toPersonId: toPerson.id!, label: label, isMutual: false, createdAt: now);
+      await DbHelper.instance.insertRelationship(rel);
+      if (!mounted) return;
+      await Provider.of<PersonProvider>(context, listen: false).loadAll();
+      await _loadData();
+    }
+  }
+
   Widget _buildRelationshipsCompact() {
+    // Edit mode: wizard-style Add Relationships row with chips + plus (only possible when editing)
+    if (_isEditing) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Add Relationships', style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500)),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 44,
+            child: ListView(
+              scrollDirection: Axis.horizontal,
+              children: [
+                ..._relationships.map((rel) {
+                  final otherId = rel.fromPersonId == _person.id ? rel.toPersonId : rel.fromPersonId;
+                  return FutureBuilder<Person?>(
+                    future: DbHelper.instance.getPersonById(otherId),
+                    builder: (context, snap) {
+                      final p = snap.data;
+                      final path = p?.imagePath;
+                      Widget av;
+                      if (path == null) {
+                        av = const CircleAvatar(radius: 14, backgroundColor: Colors.white, child: Icon(Icons.person, size: 14, color: AppColors.vividRed));
+                      } else if (path.startsWith('assets/')) {
+                        av = CircleAvatar(radius: 14, backgroundImage: AssetImage(path), backgroundColor: Colors.white);
+                      } else if (File(path).existsSync()) {
+                        av = CircleAvatar(radius: 14, backgroundImage: FileImage(File(path)));
+                      } else {
+                        av = const CircleAvatar(radius: 14, backgroundColor: Colors.white, child: Icon(Icons.person, size: 14, color: AppColors.vividRed));
+                      }
+                      return Container(
+                        margin: const EdgeInsets.only(right: 8),
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), border: Border.all(color: AppColors.coral.withValues(alpha: 0.3))),
+                        child: Row(
+                          children: [
+                            av,
+                            const SizedBox(width: 6),
+                            Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Text(p?.name.split(' ').first ?? 'Unknown', style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: Colors.black87)),
+                                Text(rel.label, style: const TextStyle(fontSize: 9, color: AppColors.coral)),
+                              ],
+                            ),
+                            const SizedBox(width: 4),
+                            GestureDetector(
+                              onTap: () => _deleteRel(rel.id!),
+                              child: const Icon(Icons.close, size: 14, color: Colors.black45),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  );
+                }),
+                // Plus button - only in edit mode (wizard style)
+                GestureDetector(
+                  onTap: _showAddRelationshipInEdit,
+                  child: Container(
+                    width: 34,
+                    height: 34,
+                    decoration: const BoxDecoration(color: AppColors.coral, shape: BoxShape.circle),
+                    child: const Icon(Icons.add, color: Colors.white, size: 18),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (_relationships.isEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text('Tap + to add a relationship', style: TextStyle(color: Colors.white.withValues(alpha: 0.7), fontSize: 10)),
+            ),
+        ],
+      );
+    }
+
+    // View mode: read-only small avatars row (no add)
     if (_relationships.isEmpty) {
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -323,7 +469,6 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
         ],
       );
     }
-    // Show as small overlapping avatars row like mock
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -354,32 +499,20 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
                   }
                   return Container(
                     margin: EdgeInsets.only(right: 6, left: i == 0 ? 0 : 0),
-                    child: GestureDetector(
-                      onTap: () async {
-                        await Navigator.push(context, MaterialPageRoute(builder: (_) => AddEditRelationshipScreen(relationship: rel)));
-                        if (!mounted) return;
-                        await _loadData();
-                        if (!mounted) return;
-                        if (!context.mounted) return;
-                        await Provider.of<PersonProvider>(context, listen: false).loadAll();
-                      },
-                      onLongPress: () => _deleteRel(rel.id!),
-                      child: Stack(
-                        clipBehavior: Clip.none,
-                        children: [
-                          av,
-                          // tiny label badge
-                          Positioned(
-                            bottom: -2,
-                            right: -4,
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
-                              decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(6), border: Border.all(color: AppColors.coral, width: 0.8)),
-                              child: Text(rel.label, style: const TextStyle(fontSize: 7, fontWeight: FontWeight.w600, color: AppColors.vividRed)),
-                            ),
+                    child: Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        av,
+                        Positioned(
+                          bottom: -2,
+                          right: -4,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                            decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(6), border: Border.all(color: AppColors.coral, width: 0.8)),
+                            child: Text(rel.label, style: const TextStyle(fontSize: 7, fontWeight: FontWeight.w600, color: AppColors.vividRed)),
                           ),
-                        ],
-                      ),
+                        ),
+                      ],
                     ),
                   );
                 },
@@ -391,64 +524,191 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
     );
   }
 
+  Future<void> _addPhoto() async {
+    if (_relationships.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Create a relationship first to add photos')),
+      );
+      return;
+    }
+    final XFile? picked = await _editPicker.pickImage(source: ImageSource.gallery);
+    if (picked == null) return;
+    // Attach to first relationship (or most recent) - simple for now
+    final targetRelId = _relationships.first.id!;
+    await DbHelper.instance.insertRelationshipImage(
+      RelationshipImage(relationshipId: targetRelId, imagePath: picked.path),
+    );
+    await _loadData();
+    if (!mounted) return;
+    await Provider.of<PersonProvider>(context, listen: false).loadAll();
+  }
+
+  void _expandPhoto(ImageProvider provider) {
+    showDialog(
+      context: context,
+      barrierColor: Colors.black87,
+      builder: (ctx) => Dialog(
+        backgroundColor: Colors.transparent,
+        insetPadding: const EdgeInsets.all(12),
+        child: Stack(
+          children: [
+            InteractiveViewer(
+              minScale: 0.8,
+              maxScale: 4,
+              child: Center(
+                child: Image(image: provider, fit: BoxFit.contain),
+              ),
+            ),
+            Positioned(
+              top: 8,
+              right: 8,
+              child: GestureDetector(
+                onTap: () => Navigator.pop(ctx),
+                child: Container(
+                  padding: const EdgeInsets.all(6),
+                  decoration: BoxDecoration(color: Colors.black54, shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 1)),
+                  child: const Icon(Icons.close, color: Colors.white, size: 20),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildGallery() {
     final allImages = _imagesByRelId.values.expand((e) => e).toList();
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        // Grey rectangle mock - contains horizontal thumbs
-        Container(
+    final isEditingGallery = _isEditing;
+
+    // Empty state - show add tile only in edit mode
+    if (allImages.isEmpty) {
+      if (!isEditingGallery) {
+        return Container(
           width: double.infinity,
-          height: 120,
+          padding: const EdgeInsets.symmetric(vertical: 24, horizontal: 16),
           decoration: BoxDecoration(color: const Color(0xFFE8E8E8), borderRadius: BorderRadius.circular(4)),
-          child: Stack(
-            alignment: Alignment.center,
-            children: [
-              if (allImages.isEmpty)
-                Text('No photos', style: TextStyle(color: Colors.black.withValues(alpha: 0.3), fontSize: 11))
-              else
-                ListView.builder(
-                  padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 10),
-                  scrollDirection: Axis.horizontal,
-                  itemCount: allImages.length,
-                  itemBuilder: (context, idx) {
-                    final img = allImages[idx];
-                    final isAsset = img.imagePath.startsWith('assets/');
-                    final prov = isAsset ? AssetImage(img.imagePath) as ImageProvider : FileImage(File(img.imagePath));
-                    return Container(
-                      width: 90,
-                      margin: EdgeInsets.only(right: idx == allImages.length - 1 ? 0 : 8),
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(4),
-                        image: DecorationImage(image: prov, fit: BoxFit.cover, onError: (_, _) {}),
-                        color: Colors.white,
-                      ),
-                    );
-                  },
-                ),
-              // Left arrow
-              Positioned(
-                left: 8,
-                child: Container(
-                  width: 22,
-                  height: 22,
-                  decoration: BoxDecoration(shape: BoxShape.circle, color: Colors.white, border: Border.all(color: Colors.black, width: 1)),
-                  child: const Icon(Icons.arrow_back, size: 14, color: Colors.black87),
-                ),
-              ),
-              Positioned(
-                right: 8,
-                child: Container(
-                  width: 22,
-                  height: 22,
-                  decoration: BoxDecoration(shape: BoxShape.circle, color: Colors.white, border: Border.all(color: Colors.black, width: 1)),
-                  child: const Icon(Icons.arrow_forward, size: 14, color: Colors.black87),
-                ),
-              ),
-            ],
+          child: Center(
+            child: Text('No photos', style: TextStyle(color: Colors.black.withValues(alpha: 0.3), fontSize: 11)),
           ),
+        );
+      }
+      // Edit mode empty - show add tile
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(8),
+        decoration: BoxDecoration(color: const Color(0xFFE8E8E8), borderRadius: BorderRadius.circular(4)),
+        child: GridView.builder(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          itemCount: 1,
+          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: 3,
+            crossAxisSpacing: 8,
+            mainAxisSpacing: 8,
+            childAspectRatio: 1,
+          ),
+          itemBuilder: (context, idx) {
+            return GestureDetector(
+              onTap: _addPhoto,
+              child: Container(
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: AppColors.coral, width: 1.2),
+                ),
+                child: const Icon(Icons.add_a_photo, color: AppColors.coral, size: 28),
+              ),
+            );
+          },
         ),
-      ],
+      );
+    }
+
+    // Gallery grid - vertical, requires scrolling down to see more
+    final itemCount = isEditingGallery ? allImages.length + 1 : allImages.length;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(color: const Color(0xFFE8E8E8), borderRadius: BorderRadius.circular(4)),
+      child: GridView.builder(
+        shrinkWrap: true,
+        physics: const NeverScrollableScrollPhysics(),
+        itemCount: itemCount,
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 3,
+          crossAxisSpacing: 8,
+          mainAxisSpacing: 8,
+          childAspectRatio: 1,
+        ),
+        itemBuilder: (context, idx) {
+          // Last tile in edit mode is Add button
+          if (isEditingGallery && idx == allImages.length) {
+            return GestureDetector(
+              onTap: _addPhoto,
+              child: Container(
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: AppColors.coral, width: 1.2),
+                ),
+                child: const Icon(Icons.add_a_photo, color: AppColors.coral, size: 28),
+              ),
+            );
+          }
+          final img = allImages[idx];
+          final isAsset = img.imagePath.startsWith('assets/');
+          final prov = isAsset ? AssetImage(img.imagePath) as ImageProvider : FileImage(File(img.imagePath));
+          return GestureDetector(
+            onTap: () async {
+              if (isEditingGallery) {
+                // Only removable in edit mode
+                final confirmed = await showDialog<bool>(
+                  context: context,
+                  builder: (ctx) => AlertDialog(
+                    backgroundColor: AppColors.bgLight,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    title: const Text('Remove photo?', style: TextStyle(color: Color(0xFF2B0000), fontWeight: FontWeight.bold, fontSize: 14)),
+                    content: const Text('Delete this photo?', style: TextStyle(color: Colors.black54, fontSize: 12)),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel', style: TextStyle(color: Colors.black54))),
+                      TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Delete', style: TextStyle(color: AppColors.vividRed))),
+                    ],
+                  ),
+                );
+                if (confirmed == true) {
+                  await DbHelper.instance.deleteRelationshipImage(img.id!);
+                  await _loadData();
+                  if (!mounted) return;
+                  if (!context.mounted) return;
+                  await Provider.of<PersonProvider>(context, listen: false).loadAll();
+                }
+              } else {
+                // Read mode: expand to view
+                _expandPhoto(prov);
+              }
+            },
+            child: Container(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(4),
+                image: DecorationImage(image: prov, fit: BoxFit.cover, onError: (_, _) {}),
+                color: Colors.white,
+              ),
+              child: isEditingGallery
+                  ? Align(
+                      alignment: Alignment.topRight,
+                      child: Container(
+                        margin: const EdgeInsets.all(4),
+                        padding: const EdgeInsets.all(3),
+                        decoration: BoxDecoration(color: Colors.black54, shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 1)),
+                        child: const Icon(Icons.close, size: 10, color: Colors.white),
+                      ),
+                    )
+                  : null,
+            ),
+          );
+        },
+      ),
     );
   }
 
@@ -513,32 +773,6 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
                           // Detailed sections revealed on scroll when sheet expands
                           const Divider(color: Colors.white24, height: 20),
                           _DetailedSections(person: _person, relationships: _relationships),
-                          const SizedBox(height: 20),
-                          // Add Relationship CTA above gallery
-                          SizedBox(
-                            width: double.infinity,
-                            child: ElevatedButton.icon(
-                              onPressed: () async {
-                                await Navigator.push(
-                                  context,
-                                  MaterialPageRoute(builder: (_) => AddEditRelationshipScreen(fromPerson: _person)),
-                                );
-                                if (!mounted) return;
-                                await _loadData();
-                                if (!mounted) return;
-                                if (!context.mounted) return;
-                                await Provider.of<PersonProvider>(context, listen: false).loadAll();
-                              },
-                              icon: const Icon(Icons.favorite, color: Colors.white, size: 16),
-                              label: const Text('Add Relationship', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 12)),
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: AppColors.coral,
-                                elevation: 0,
-                                padding: const EdgeInsets.symmetric(vertical: 12),
-                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                              ),
-                            ),
-                          ),
                           const SizedBox(height: 20),
                           // Gallery at bottom — requires scrolling past details to see photos
                           const Text('PHOTOS', style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700, letterSpacing: 0.8)),

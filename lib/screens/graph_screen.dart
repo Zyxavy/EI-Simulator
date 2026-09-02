@@ -51,6 +51,8 @@ class _GraphScreenState extends State<GraphScreen>
   // Contextual add button (appears at tap location on empty canvas, per spec)
   Offset? _tapAddPos;
   DateTime? _tapAddTime;
+  Offset? _pendingAddCanvasPos;
+  bool _didDrag = false;
 
   static const double _nodeRadius = 34.0;
   static const double _repulsion = 8000.0;
@@ -123,9 +125,17 @@ class _GraphScreenState extends State<GraphScreen>
     _nodes.removeWhere((id, _) => !ids.contains(id));
     for (final p in persons) {
       if (!_nodes.containsKey(p.id)) {
-        final angle = _rng.nextDouble() * 2 * pi;
-        final r = 80.0 + _rng.nextDouble() * 140;
-        _nodes[p.id!] = _PhysNode(p, Offset(cos(angle) * r, sin(angle) * r));
+        Offset pos;
+        if (_pendingAddCanvasPos != null) {
+          // Place new node where user tapped to add (with slight jitter)
+          pos = _pendingAddCanvasPos! + Offset((_rng.nextDouble() - 0.5) * 20, (_rng.nextDouble() - 0.5) * 20);
+          _pendingAddCanvasPos = null;
+        } else {
+          final angle = _rng.nextDouble() * 2 * pi;
+          final r = 80.0 + _rng.nextDouble() * 140;
+          pos = Offset(cos(angle) * r, sin(angle) * r);
+        }
+        _nodes[p.id!] = _PhysNode(p, pos);
       } else {
         _nodes[p.id!] = _PhysNode(p, _nodes[p.id!]!.pos)
           ..vel = _nodes[p.id!]!.vel
@@ -285,7 +295,7 @@ class _GraphScreenState extends State<GraphScreen>
                         left: 12,
                         bottom: 12,
                         child: Text(
-                          'Debug: 0 persons (DB empty or seeding failed)\nTry: adb shell pm clear com.example.ei_simulator then rerun',
+                          'Debug: 0 persons (DB empty or seeding failed)\nTry: adb shell pm clear com.example.situationship then rerun',
                           style: TextStyle(color: Colors.black.withValues(alpha: 0.5), fontSize: 10),
                         ),
                       ),
@@ -350,6 +360,7 @@ class _GraphScreenState extends State<GraphScreen>
           _focalPointStart = details.focalPoint;
           _canvasOffsetStart = _canvasOffset;
           _scaleStart = _scale;
+          _didDrag = false;
           // Any pan/zoom or drag hides contextual add button
           if (_tapAddPos != null) setState(() => _tapAddPos = null);
 
@@ -366,12 +377,15 @@ class _GraphScreenState extends State<GraphScreen>
             final node = _nodes[_draggingId!];
             if (node != null) {
               final canvasPos = _toCanvas(details.focalPoint);
+              _didDrag = true;
               setState(() {
                 node.pos = canvasPos - _dragLocalStart;
                 node.vel = Offset.zero;
               });
             }
           } else if (_draggingId == null) {
+            // Pan threshold to distinguish tap vs drag
+            if ((details.focalPoint - _focalPointStart).distance > 6) _didDrag = true;
             setState(() {
               _scale = (_scaleStart * details.scale).clamp(0.2, 3.0);
               _canvasOffset = _canvasOffsetStart + (details.focalPoint - _focalPointStart);
@@ -382,9 +396,18 @@ class _GraphScreenState extends State<GraphScreen>
           if (_draggingId != null) {
             _nodes[_draggingId!]?.pinned = false;
           }
+          // Keep didDrag true briefly so onTapUp can ignore
+          Future.delayed(const Duration(milliseconds: 150), () {
+            _didDrag = false;
+          });
           _draggingId = null;
         },
         onTapUp: (details) {
+          if (_didDrag) {
+            // Was a drag/pan — ignore tap
+            _didDrag = false;
+            return;
+          }
           final canvasPos = _toCanvas(details.localPosition);
           final hit = _hitTest(canvasPos);
           if (hit != null) {
@@ -392,7 +415,6 @@ class _GraphScreenState extends State<GraphScreen>
             showProfileBottomSheet(context, hit.person);
           } else {
             // Tapped empty space (or near nodes) -> show contextual add button at tap location
-            // Clamp to graph bounds with 28px inset for FAB
             final clamped = Offset(
               details.localPosition.dx.clamp(28.0, constraints.maxWidth - 28.0),
               details.localPosition.dy.clamp(28.0, constraints.maxHeight - 28.0),
@@ -461,11 +483,6 @@ class _GraphScreenState extends State<GraphScreen>
                 );
               }
 
-              // Keep tags: name below avatar (and optional personality chip)
-              final firstTag = node.person.personality.split(',').map((s) => s.trim()).where((s) => s.isNotEmpty).toList().isNotEmpty
-                  ? node.person.personality.split(',').first.trim()
-                  : '';
-
               return Positioned(
                 left: center.dx - r,
                 top: center.dy - r,
@@ -509,23 +526,6 @@ class _GraphScreenState extends State<GraphScreen>
                         ),
                       ),
                     ),
-                    if (firstTag.isNotEmpty)
-                      Container(
-                        margin: const EdgeInsets.only(top: 2),
-                        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                        decoration: BoxDecoration(
-                          color: AppColors.coral.withValues(alpha: 0.15),
-                          borderRadius: BorderRadius.circular(6),
-                        ),
-                        child: Text(
-                          firstTag,
-                          style: TextStyle(
-                            color: AppColors.vividRed,
-                            fontSize: (7 * _scale).clamp(6.0, 8.0),
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ),
                   ],
                 ),
               );
@@ -541,8 +541,9 @@ class _GraphScreenState extends State<GraphScreen>
                   color: Colors.transparent,
                   child: GestureDetector(
                     onTap: () {
+                      // Store canvas position so new node appears where user tapped
+                      _pendingAddCanvasPos = _toCanvas(_tapAddPos!);
                       setState(() => _tapAddPos = null);
-                      // Open wizard; position hint could be stored for future node placement
                       Navigator.push(
                         context,
                         MaterialPageRoute(builder: (_) => const AddNodeWizardScreen()),
@@ -562,18 +563,7 @@ class _GraphScreenState extends State<GraphScreen>
                   ),
                 ),
               ),
-            // Tap to dismiss hint for contextual add
-            if (_tapAddPos != null)
-              Positioned(
-                left: _tapAddPos!.dx - 40,
-                top: _tapAddPos!.dy + 28,
-                child: IgnorePointer(
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                    decoration: BoxDecoration(color: Colors.black87, borderRadius: BorderRadius.circular(6)),
-                  ),
-                ),
-              ),
+
           ],
         ),
       );
@@ -608,15 +598,24 @@ class _EdgePainter extends CustomPainter {
       final from = _toScreen(a.pos);
       final to = _toScreen(b.pos);
 
-      // Mock: thin black line, vivid red if mutual
-      final edgePaint = Paint()
-        ..color = rel.isMutual ? AppColors.vividRed.withValues(alpha: 0.9) : Colors.black.withValues(alpha: 0.75)
-        ..strokeWidth = rel.isMutual ? 1.6 * scale : 1.0 * scale
-        ..style = PaintingStyle.stroke;
+      // Shorten line so it stops at node borders (arrow not blocked by widget)
+      final edgeGap = nodeRadius * scale + 14;
+      final dirUnit = (to - from) / (to - from).distance;
+      final lineFrom = from + dirUnit * edgeGap;
+      final lineTo = to - dirUnit * edgeGap;
+      // Skip if nodes too close
+      if ((lineTo - lineFrom).distance < 1) {
+        _drawArrow(canvas, from, to, rel.isMutual);
+      } else {
+        final edgePaint = Paint()
+          ..color = rel.isMutual ? AppColors.vividRed.withValues(alpha: 0.9) : Colors.black.withValues(alpha: 0.75)
+          ..strokeWidth = rel.isMutual ? 1.6 * scale : 1.0 * scale
+          ..style = PaintingStyle.stroke;
 
-      canvas.drawLine(from, to, edgePaint);
+        canvas.drawLine(lineFrom, lineTo, edgePaint);
 
-      _drawArrow(canvas, from, to, rel.isMutual);
+        _drawArrow(canvas, from, to, rel.isMutual);
+      }
 
       _drawEdgeLabel(canvas, from, to, rel.label, rel.isMutual);
     }
@@ -627,7 +626,8 @@ class _EdgePainter extends CustomPainter {
     final len = dir.distance;
     if (len < 1) return;
     final unit = dir / len;
-    final tipOffset = nodeRadius * scale + 6;
+    // Tip outside the node's circular widget (radius + white border + shadow)
+    final tipOffset = nodeRadius * scale + 14;
     final tip = to - unit * tipOffset;
 
     const arrowLen = 7.0;
@@ -656,7 +656,7 @@ class _EdgePainter extends CustomPainter {
 
     if (mutual) {
       final fromUnit = -unit;
-      final fromTip = from - fromUnit * (-(nodeRadius * scale + 6));
+      final fromTip = from - fromUnit * (-(nodeRadius * scale + 14));
       final fromLeft = Offset(
         fromTip.dx - arrowLen * (fromUnit.dx * cos(arrowAngle) - fromUnit.dy * sin(arrowAngle)),
         fromTip.dy - arrowLen * (fromUnit.dy * cos(arrowAngle) + fromUnit.dx * sin(arrowAngle)),

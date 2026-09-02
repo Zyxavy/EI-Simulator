@@ -238,7 +238,9 @@ class _AddEditRelationshipScreenState extends State<AddEditRelationshipScreen> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 DropdownButtonFormField<Person>(
-                  initialValue: _selectedFrom,
+                  initialValue: _selectedFrom != null && persons.any((p) => p.id == _selectedFrom!.id)
+                      ? persons.firstWhere((p) => p.id == _selectedFrom!.id)
+                      : null,
                   dropdownColor: Colors.grey[900],
                   style: const TextStyle(color: Colors.white),
                   decoration: const InputDecoration(
@@ -260,7 +262,9 @@ class _AddEditRelationshipScreenState extends State<AddEditRelationshipScreen> {
                 ),
                 const SizedBox(height: 16),
                 DropdownButtonFormField<Person>(
-                  initialValue: _selectedTo,
+                  initialValue: _selectedTo != null && persons.any((p) => p.id == _selectedTo!.id)
+                      ? persons.firstWhere((p) => p.id == _selectedTo!.id)
+                      : null,
                   dropdownColor: Colors.grey[900],
                   style: const TextStyle(color: Colors.white),
                   decoration: const InputDecoration(
