@@ -571,7 +571,6 @@ class _GraphScreenState extends State<GraphScreen>
                   child: Container(
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                     decoration: BoxDecoration(color: Colors.black87, borderRadius: BorderRadius.circular(6)),
-                    child: const Text('Tap + to add node here', style: TextStyle(color: Colors.white, fontSize: 9)),
                   ),
                 ),
               ),
