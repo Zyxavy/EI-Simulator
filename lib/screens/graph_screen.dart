@@ -1,4 +1,3 @@
-import 'dart:io' show File;
 import 'dart:math';
 
 import 'package:flutter/material.dart';
@@ -43,9 +42,6 @@ class _GraphScreenState extends State<GraphScreen>
   // Drag state
   int? _draggingId;
   Offset _dragLocalStart = Offset.zero;
-
-  // Tap detection
-  Offset? _pointerDownPos;
 
   static const double _nodeRadius = 32.0;
   static const double _repulsion = 8000.0;
