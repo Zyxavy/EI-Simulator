@@ -460,7 +460,9 @@ class _AddNodeWizardScreenState extends State<AddNodeWizardScreen> {
                     children: [
                       CircleAvatar(
                         radius: 14,
-                        backgroundImage: isAsset ? AssetImage(pr.to.imagePath) : FileImage(File(pr.to.imagePath)) as ImageProvider,
+                        backgroundImage: isAsset
+                            ? AssetImage(pr.to.imagePath)
+                            : ResizeImage(FileImage(File(pr.to.imagePath)), width: 56, height: 56) as ImageProvider,
                         backgroundColor: Colors.white,
                         onBackgroundImageError: (_, _) {},
                       ),

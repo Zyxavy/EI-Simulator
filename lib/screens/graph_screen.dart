@@ -857,6 +857,8 @@ class _EdgePainter extends CustomPainter {
   static final Paint _arrowNormal = Paint()
     ..color = _normalEdge
     ..style = PaintingStyle.fill;
+  static final Paint _mutualLinePaint = Paint()..style = PaintingStyle.stroke;
+  static final Paint _normalLinePaint = Paint()..style = PaintingStyle.stroke;
 
   _EdgePainter({
     required this.nodes,
@@ -914,11 +916,10 @@ class _EdgePainter extends CustomPainter {
       final lineFrom = from + dirUnit * edgeGap;
       final lineTo = to - dirUnit * edgeGap;
       if ((lineTo - lineFrom).distance >= 1) {
-        final edgePaint = Paint()
-          ..color = rel.isMutual ? _mutualEdge : _normalEdge
-          ..strokeWidth = (rel.isMutual ? 1.6 : 1.0) * scale
-          ..style = PaintingStyle.stroke;
-        canvas.drawLine(lineFrom, lineTo, edgePaint);
+        final Paint linePaint = rel.isMutual ? _mutualLinePaint : _normalLinePaint;
+        linePaint.color = rel.isMutual ? _mutualEdge : _normalEdge;
+        linePaint.strokeWidth = (rel.isMutual ? 1.6 : 1.0) * scale;
+        canvas.drawLine(lineFrom, lineTo, linePaint);
       }
       _drawArrow(canvas, from, to, rel.isMutual);
       _drawEdgeLabel(canvas, from, to, rel.label, rel.isMutual);

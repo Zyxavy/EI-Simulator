@@ -22,7 +22,7 @@ class DbHelper {
     final path = join(dbPath, filePath);
     return await openDatabase(
       path,
-      version: 2,
+      version: 3,
       onConfigure: (db) async => await db.execute('PRAGMA foreign_keys = ON'),
       onCreate: _createDB,
       onUpgrade: _upgradeDB,
@@ -67,6 +67,7 @@ class DbHelper {
     // Indexes for search/lookup hot paths — avoid full table scans on every keystroke
     await db.execute('CREATE INDEX IF NOT EXISTS idx_person_name ON Person(name COLLATE NOCASE)');
     await db.execute('CREATE INDEX IF NOT EXISTS idx_person_personality ON Person(personality COLLATE NOCASE)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_person_created ON Person(createdAt)');
     await db.execute('CREATE INDEX IF NOT EXISTS idx_rel_from ON Relationship(fromPersonId)');
     await db.execute('CREATE INDEX IF NOT EXISTS idx_rel_to ON Relationship(toPersonId)');
     await db.execute('CREATE INDEX IF NOT EXISTS idx_rel_image_relId ON RelationshipImage(relationshipId)');
@@ -79,6 +80,9 @@ class DbHelper {
       await db.execute('CREATE INDEX IF NOT EXISTS idx_rel_from ON Relationship(fromPersonId)');
       await db.execute('CREATE INDEX IF NOT EXISTS idx_rel_to ON Relationship(toPersonId)');
       await db.execute('CREATE INDEX IF NOT EXISTS idx_rel_image_relId ON RelationshipImage(relationshipId)');
+    }
+    if (oldVersion < 3) {
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_person_created ON Person(createdAt)');
     }
   }
 
@@ -121,42 +125,46 @@ class DbHelper {
     return await db.delete('Person', where: 'id = ?', whereArgs: [id]);
   }
 
-  // SEARCH — uses indexes on name/personality; LIMIT avoids scanning large result
+  String _escapeLike(String input) {
+    return input.replaceAll(r'\', r'\\').replaceAll('%', r'\%').replaceAll('_', r'\_');
+  }
+
+  // SEARCH — uses ESCAPE for %/_ wildcards, LIMIT avoids large scan; leading % still scans but debounced + LIMIT 50
   Future<List<Person>> searchPersons(String query) async {
     final db = await database;
+    final escaped = _escapeLike(query);
+    final pattern = '%$escaped%';
     final maps = await db.query(
       'Person',
-      where: 'name LIKE ? COLLATE NOCASE OR personality LIKE ? COLLATE NOCASE',
-      whereArgs: ['%$query%', '%$query%'],
+      where: r"name LIKE ? ESCAPE '\' COLLATE NOCASE OR personality LIKE ? ESCAPE '\' COLLATE NOCASE",
+      whereArgs: [pattern, pattern],
       limit: 50,
     );
     return maps.map((m) => Person.fromMap(m)).toList();
   }
 
   //RELATIONSHIP CRUD
-  // INSERT
+  // INSERT — transactional to avoid race
   Future<int> insertRelationship(Relationship relationship) async {
     final db = await database;
-
-    // Check if reverse already exists
-    final reverse = await db.query(
-      'Relationship',
-      where: 'fromPersonId = ? AND toPersonId = ?',
-      whereArgs: [relationship.toPersonId, relationship.fromPersonId],
-    );
-
-    if (reverse.isNotEmpty) {
-      final reverseId = reverse.first['id'] as int;
-      await db.update(
+    return await db.transaction((txn) async {
+      final reverse = await txn.query(
         'Relationship',
-        {'isMutual': 1},
-        where: 'id = ?',
-        whereArgs: [reverseId],
+        where: 'fromPersonId = ? AND toPersonId = ?',
+        whereArgs: [relationship.toPersonId, relationship.fromPersonId],
       );
-      return reverseId;
-    }
-
-    return await db.insert('Relationship', relationship.toMap());
+      if (reverse.isNotEmpty) {
+        final reverseId = reverse.first['id'] as int;
+        await txn.update(
+          'Relationship',
+          {'isMutual': 1},
+          where: 'id = ?',
+          whereArgs: [reverseId],
+        );
+        return reverseId;
+      }
+      return await txn.insert('Relationship', relationship.toMap());
+    });
   }
 
   // READ ALL
@@ -232,82 +240,80 @@ class DbHelper {
     );
   }
 
-  //SEED DATA
+  //SEED DATA — transactional + COUNT(*) gate (avoids loading all rows)
   Future<void> seedDatabase() async {
     final db = await database;
-
-    // Gate: only seed once
-    final existing = await db.query('Person');
-    if (existing.isNotEmpty) return;
-
+    final cnt = Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM Person')) ?? 0;
+    if (cnt > 0) return;
     final now = DateTime.now().toIso8601String();
+    await db.transaction((txn) async {
+      // Insert persons
+      final id1 = await txn.insert('Person', {
+        'name': 'John Reyes',
+        'description': 'A 3rd year CS student who spends more time debugging his love life than his code.',
+        'personality': 'Tsundere, Overconfident, Secretly Soft',
+        'imagePath': 'assets/images/john.png',
+        'createdAt': now,
+      });
 
-    // Insert persons
-    final id1 = await db.insert('Person', {
-      'name': 'John Reyes',
-      'description': 'A 3rd year CS student who spends more time debugging his love life than his code.',
-      'personality': 'Tsundere, Overconfident, Secretly Soft',
-      'imagePath': 'assets/images/john.png',
-      'createdAt': now,
-    });
+      final id2 = await txn.insert('Person', {
+        'name': 'Maya Santos',
+        'description': 'Appears completely unbothered but has a Notion board tracking everyone\'s relationship status.',
+        'personality': 'Calculated, Charming, Chaotic Neutral',
+        'imagePath': 'assets/images/maya.png',
+        'createdAt': now,
+      });
 
-    final id2 = await db.insert('Person', {
-      'name': 'Maya Santos',
-      'description': 'Appears completely unbothered but has a Notion board tracking everyone\'s relationship status.',
-      'personality': 'Calculated, Charming, Chaotic Neutral',
-      'imagePath': 'assets/images/maya.png',
-      'createdAt': now,
-    });
+      final id3 = await txn.insert('Person', {
+        'name': 'Carlos Delos Reyes',
+        'description':
+            'Main character energy. Unfortunately he is not the main character.',
+        'personality': 'Delusional, Loyal, Oblivious',
+        'imagePath': 'assets/images/carlos.png',
+        'createdAt': now,
+      });
 
-    final id3 = await db.insert('Person', {
-      'name': 'Carlos Delos Reyes',
-      'description':
-          'Main character energy. Unfortunately he is not the main character.',
-      'personality': 'Delusional, Loyal, Oblivious',
-      'imagePath': 'assets/images/carlos.png',
-      'createdAt': now,
-    });
+      // Insert relationships
+      final r1 = await txn.insert('Relationship', {
+        'fromPersonId': id1,
+        'toPersonId': id2,
+        'label': 'Situationship',
+        'isMutual': 0,
+        'createdAt': now,
+      });
 
-    // Insert relationships
-    final r1 = await db.insert('Relationship', {
-      'fromPersonId': id1,
-      'toPersonId': id2,
-      'label': 'Situationship',
-      'isMutual': 0,
-      'createdAt': now,
-    });
+      final r2 = await txn.insert('Relationship', {
+        'fromPersonId': id2,
+        'toPersonId': id3,
+        'label': 'Crush',
+        'isMutual': 1,
+        'createdAt': now,
+      });
 
-    final r2 = await db.insert('Relationship', {
-      'fromPersonId': id2,
-      'toPersonId': id3,
-      'label': 'Crush',
-      'isMutual': 1,
-      'createdAt': now,
-    });
+      final r3 = await txn.insert('Relationship', {
+        'fromPersonId': id3,
+        'toPersonId': id1,
+        'label': 'Ex',
+        'isMutual': 0,
+        'createdAt': now,
+      });
 
-    final r3 = await db.insert('Relationship', {
-      'fromPersonId': id3,
-      'toPersonId': id1,
-      'label': 'Ex',
-      'isMutual': 0,
-      'createdAt': now,
-    });
-
-    await db.insert('RelationshipImage', {
-      'relationshipId': r1,
-      'imagePath': 'assets/images/john_maya_1.png',
-    });
-    await db.insert('RelationshipImage', {
-      'relationshipId': r1,
-      'imagePath': 'assets/images/john_maya_2.png',
-    });
-    await db.insert('RelationshipImage', {
-      'relationshipId': r2,
-      'imagePath': 'assets/images/maya_carlos_1.png',
-    });
-    await db.insert('RelationshipImage', {
-      'relationshipId': r3,
-      'imagePath': 'assets/images/carlos_john_1.png',
+      await txn.insert('RelationshipImage', {
+        'relationshipId': r1,
+        'imagePath': 'assets/images/john_maya_1.png',
+      });
+      await txn.insert('RelationshipImage', {
+        'relationshipId': r1,
+        'imagePath': 'assets/images/john_maya_2.png',
+      });
+      await txn.insert('RelationshipImage', {
+        'relationshipId': r2,
+        'imagePath': 'assets/images/maya_carlos_1.png',
+      });
+      await txn.insert('RelationshipImage', {
+        'relationshipId': r3,
+        'imagePath': 'assets/images/carlos_john_1.png',
+      });
     });
   }
 }

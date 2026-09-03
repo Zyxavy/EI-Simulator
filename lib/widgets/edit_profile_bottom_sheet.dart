@@ -107,9 +107,10 @@ class _EditSheetContentState extends State<_EditSheetContent> {
     if (isAsset) {
       avatar = CircleAvatar(radius: 42, backgroundImage: AssetImage(_imagePath!), backgroundColor: Colors.white);
     } else if (fileExists) {
-      avatar = CircleAvatar(radius: 42, backgroundImage: FileImage(File(_imagePath!)));
-    } else if (_imagePath != null && _imagePath!.isNotEmpty) {
-      avatar = CircleAvatar(radius: 42, backgroundImage: FileImage(File(_imagePath!)), backgroundColor: Colors.white);
+      avatar = CircleAvatar(
+          radius: 42,
+          backgroundImage: ResizeImage(FileImage(File(_imagePath!)), width: 168, height: 168),
+          onBackgroundImageError: (_, _) {});
     } else {
       avatar = const CircleAvatar(radius: 42, backgroundColor: Colors.white, child: Icon(Icons.person, size: 36, color: AppColors.vividRed));
     }
