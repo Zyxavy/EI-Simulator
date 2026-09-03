@@ -689,8 +689,8 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
           shrinkWrap: true,
           physics: const NeverScrollableScrollPhysics(),
           itemCount: 1,
-          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: 3,
+          gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+            maxCrossAxisExtent: 140,
             crossAxisSpacing: 8,
             mainAxisSpacing: 8,
             childAspectRatio: 1,
@@ -723,8 +723,8 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
         itemCount: itemCount,
         addRepaintBoundaries: true,
         addAutomaticKeepAlives: false,
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: 3,
+        gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+          maxCrossAxisExtent: 140,
           crossAxisSpacing: 8,
           mainAxisSpacing: 8,
           childAspectRatio: 1,
@@ -805,11 +805,14 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      decoration: const BoxDecoration(
-        color: AppColors.vividRed,
-        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
-      ),
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 640),
+        child: Container(
+          decoration: const BoxDecoration(
+            color: AppColors.vividRed,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+          ),
       child: Column(
         children: [
           const SizedBox(height: 8),
@@ -963,6 +966,8 @@ class _ProfileSheetContentState extends State<_ProfileSheetContent> {
                   ),
           ),
         ],
+          ),
+        ),
       ),
     );
   }

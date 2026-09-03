@@ -125,9 +125,12 @@ class _EditSheetContentState extends State<_EditSheetContent> {
           Center(child: Container(width: 36, height: 4, decoration: BoxDecoration(color: Colors.black12, borderRadius: BorderRadius.circular(2)))),
           const SizedBox(height: 6),
           Expanded(
-            child: ListView(
-              controller: widget.scrollController,
-              padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
+            child: Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 560),
+                child: ListView(
+                  controller: widget.scrollController,
+                  padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
               children: [
                 const Center(child: Text('Edit Profile', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: Colors.black87))),
                 const SizedBox(height: 4),
@@ -242,6 +245,8 @@ class _EditSheetContentState extends State<_EditSheetContent> {
                   ),
                 ),
               ],
+                ),
+              ),
             ),
           ),
         ],

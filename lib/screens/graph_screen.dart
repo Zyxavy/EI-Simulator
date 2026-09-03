@@ -481,77 +481,144 @@ class _GraphScreenState extends State<GraphScreen> with TickerProviderStateMixin
           ),
         ),
       ),
-      body: Column(
-        children: [
-          Expanded(
-            // Selector: rebuild only when persons/rels identity or length changes,
-            // not on every notifyListeners that doesn't affect graph data.
-            child: Selector<PersonProvider, _GraphData>(
-              selector: (_, p) => _GraphData(p.persons, p.relationships),
-              shouldRebuild: (a, b) =>
-                  !identical(a.persons, b.persons) ||
-                  !identical(a.relationships, b.relationships) ||
-                  a.persons.length != b.persons.length ||
-                  a.relationships.length != b.relationships.length,
-              builder: (context, data, _) {
-                final provider = context.read<PersonProvider>();
-                if (kDebugMode) {
-                  debugPrint('GraphScreen build: persons=${data.persons.length} rels=${data.relationships.length} nodes=${_nodes.length}');
-                }
-                if (data.persons.isEmpty) {
-                  _latestRels = const [];
-                  return Stack(
-                    children: [
-                      const Center(
-                        child: Text(
-                          'No one here yet.\nTap anywhere on the graph to add someone.',
-                          textAlign: TextAlign.center,
-                          style: TextStyle(color: Colors.black38),
-                        ),
-                      ),
-                      Positioned(
-                        left: 12,
-                        bottom: 12,
-                        child: Text(
-                          'Debug: 0 persons (DB empty or seeding failed)\nTry: adb shell pm clear com.example.situationship then rerun',
-                          style: TextStyle(color: Colors.black.withValues(alpha: 0.5), fontSize: 10),
-                        ),
-                      ),
-                    ],
-                  );
-                }
-                final needsSync = data.persons.any((p) => !_nodes.containsKey(p.id)) ||
-                    _nodes.length != data.persons.length ||
-                    data.persons.any((p) => _nodes[p.id]?.person != p);
-                if (needsSync) _syncNodes(data.persons);
-                _latestRels = data.relationships;
-                return Stack(
-                  children: [
-                    RepaintBoundary(child: _buildInteractiveGraph(provider, data.relationships)),
-                    Positioned(
-                      left: 12,
-                      bottom: 12,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(alpha: 0.9),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: AppColors.coral.withValues(alpha: 0.3)),
-                        ),
-                        child: Text(
-                          '${data.persons.length} persons • ${data.relationships.length} rels',
-                          style: const TextStyle(color: Colors.black54, fontSize: 10),
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          final bool isDesktop = constraints.maxWidth > 900;
+          // Reusable graph column (used in both layouts)
+          Widget graphColumn = Column(
+            children: [
+              Expanded(
+                child: Selector<PersonProvider, _GraphData>(
+                  selector: (_, p) => _GraphData(p.persons, p.relationships),
+                  shouldRebuild: (a, b) =>
+                      !identical(a.persons, b.persons) ||
+                      !identical(a.relationships, b.relationships) ||
+                      a.persons.length != b.persons.length ||
+                      a.relationships.length != b.relationships.length,
+                  builder: (context, data, _) {
+                    final provider = context.read<PersonProvider>();
+                    if (kDebugMode) {
+                      debugPrint('GraphScreen build: persons=${data.persons.length} rels=${data.relationships.length} nodes=${_nodes.length}');
+                    }
+                    if (data.persons.isEmpty) {
+                      _latestRels = const [];
+                      return Stack(
+                        children: [
+                          const Center(
+                            child: Text(
+                              'No one here yet.\nTap anywhere on the graph to add someone.',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(color: Colors.black38),
+                            ),
+                          ),
+                          Positioned(
+                            left: 12,
+                            bottom: 12,
+                            child: Text(
+                              'Debug: 0 persons (DB empty or seeding failed)\nTry: adb shell pm clear com.example.situationship then rerun',
+                              style: TextStyle(color: Colors.black.withValues(alpha: 0.5), fontSize: 10),
+                            ),
+                          ),
+                        ],
+                      );
+                    }
+                    final needsSync = data.persons.any((p) => !_nodes.containsKey(p.id)) ||
+                        _nodes.length != data.persons.length ||
+                        data.persons.any((p) => _nodes[p.id]?.person != p);
+                    if (needsSync) _syncNodes(data.persons);
+                    _latestRels = data.relationships;
+                    return Stack(
+                      children: [
+                        RepaintBoundary(child: _buildInteractiveGraph(provider, data.relationships)),
+                        // On small screens show overlay badge; on desktop badge moves to sidebar
+                        if (!isDesktop)
+                          Positioned(
+                            left: 12,
+                            bottom: 12,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: 0.9),
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(color: AppColors.coral.withValues(alpha: 0.3)),
+                              ),
+                              child: Text(
+                                '${data.persons.length} persons • ${data.relationships.length} rels',
+                                style: const TextStyle(color: Colors.black54, fontSize: 10),
+                              ),
+                            ),
+                          ),
+                      ],
+                    );
+                  },
+                ),
+              ),
+              Container(height: 1, color: AppColors.vividRed),
+              // Bottom pale area scales with screen — fixed 84 on phone, smaller on desktop
+              Container(height: isDesktop ? 48 : 84, width: double.infinity, color: AppColors.bgLight),
+            ],
+          );
+
+          if (isDesktop) {
+            // Large-screen layout: graph + sidebar (prevents stretching, uses Expanded/Flexible correctly)
+            return Row(
+              children: [
+                Expanded(child: graphColumn),
+                const VerticalDivider(width: 1, color: AppColors.vividRed),
+                SizedBox(
+                  width: 320,
+                  child: Selector<PersonProvider, _GraphData>(
+                      selector: (_, p) => _GraphData(p.persons, p.relationships),
+                      builder: (_, data, _) => Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text('Overview',
+                                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: Color(0xFF2B0000), letterSpacing: 0.8)),
+                            const SizedBox(height: 12),
+                            Container(
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                  color: Colors.white, borderRadius: BorderRadius.circular(12), border: Border.all(color: AppColors.coral.withValues(alpha: 0.2))),
+                              child: Row(
+                                children: [
+                                  Expanded(
+                                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                    Text('${data.persons.length}', style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w700, color: AppColors.vividRed)),
+                                    const Text('persons', style: TextStyle(fontSize: 11, color: Colors.black54)),
+                                  ])),
+                                  Container(width: 1, height: 36, color: Colors.black12),
+                                  const SizedBox(width: 12),
+                                  Expanded(
+                                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                    Text('${data.relationships.length}', style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w700, color: AppColors.coral)),
+                                    const Text('relationships', style: TextStyle(fontSize: 11, color: Colors.black54)),
+                                  ])),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(height: 16),
+                            const Text('TIP', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: Colors.black54, letterSpacing: 0.8)),
+                            const SizedBox(height: 6),
+                            const Text('Drag nodes to reposition • Pinch to zoom • Tap empty space to add\nOn large screens graph and details sit side-by-side to avoid stretching.',
+                                style: TextStyle(fontSize: 11, color: Colors.black54, height: 1.4)),
+                            const Spacer(),
+                            const Divider(height: 1),
+                            const SizedBox(height: 12),
+                            const Text('Window size determines layout — not device type.\nResize window to see phone ↔ desktop transition (LayoutBuilder).',
+                                style: TextStyle(fontSize: 10, color: Colors.black38, fontStyle: FontStyle.italic)),
+                          ],
                         ),
                       ),
                     ),
-                  ],
-                );
-              },
-            ),
-          ),
-          Container(height: 1, color: AppColors.vividRed),
-          Container(height: 84, width: double.infinity, color: AppColors.bgLight),
-        ],
+                  ),
+              ],
+            );
+          }
+          // Small-screen: default Column (phone)
+          return graphColumn;
+        },
       ),
     );
   }

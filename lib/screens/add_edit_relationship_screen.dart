@@ -237,12 +237,15 @@ class _AddEditRelationshipScreenState extends State<AddEditRelationshipScreen> {
             );
           }
 
-          return SingleChildScrollView(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                DropdownButtonFormField<Person>(
+          return Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 560),
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    DropdownButtonFormField<Person>(
                   initialValue: _selectedFrom != null && persons.any((p) => p.id == _selectedFrom!.id)
                       ? persons.firstWhere((p) => p.id == _selectedFrom!.id)
                       : null,
@@ -345,6 +348,8 @@ class _AddEditRelationshipScreenState extends State<AddEditRelationshipScreen> {
                   ),
                 ),
               ],
+            ),
+              ),
             ),
           );
         },

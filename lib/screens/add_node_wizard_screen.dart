@@ -814,9 +814,14 @@ class _AddNodeWizardScreenState extends State<AddNodeWizardScreen> {
     return Scaffold(
       backgroundColor: AppColors.bgLight,
       body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-          child: body,
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 560),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+              child: body,
+            ),
+          ),
         ),
       ),
     );

@@ -90,11 +90,14 @@ class _SearchSheetContentState extends State<_SearchSheetContent> {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      decoration: const BoxDecoration(
-        color: AppColors.vividRed,
-        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
-      ),
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 640),
+        child: Container(
+          decoration: const BoxDecoration(
+            color: AppColors.vividRed,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+          ),
       child: Column(
         children: [
           const SizedBox(height: 8),
@@ -142,6 +145,8 @@ class _SearchSheetContentState extends State<_SearchSheetContent> {
           const SizedBox(height: 14),
           Expanded(child: _buildBody()),
         ],
+          ),
+        ),
       ),
     );
   }
@@ -175,13 +180,21 @@ class _SearchSheetContentState extends State<_SearchSheetContent> {
         ],
       );
     }
-    return ListView.builder(
-      controller: widget.scrollController,
-      padding: const EdgeInsets.fromLTRB(12, 4, 12, 24),
-      itemCount: _results.length,
-      addRepaintBoundaries: true,
-      addAutomaticKeepAlives: false,
-      itemBuilder: (context, i) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // Adaptive: grid on large screens so results don't stretch full width
+        if (constraints.maxWidth > 600) {
+          return GridView.builder(
+            controller: widget.scrollController,
+            padding: const EdgeInsets.fromLTRB(12, 4, 12, 24),
+            gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+              maxCrossAxisExtent: 300,
+              mainAxisExtent: 56,
+              crossAxisSpacing: 8,
+              mainAxisSpacing: 8,
+            ),
+            itemCount: _results.length,
+            itemBuilder: (context, i) {
         final p = _results[i];
         final isAsset = p.imagePath.startsWith('assets/');
         ImageProvider bg;
@@ -216,6 +229,38 @@ class _SearchSheetContentState extends State<_SearchSheetContent> {
               ],
             ),
           ),
+        );
+      },
+          );
+        }
+        // Small screen fallback: single column list (more readable)
+        return ListView.builder(
+          controller: widget.scrollController,
+          padding: const EdgeInsets.fromLTRB(12, 4, 12, 24),
+          itemCount: _results.length,
+          addRepaintBoundaries: true,
+          addAutomaticKeepAlives: false,
+          itemBuilder: (context, i) {
+            final p = _results[i];
+            final isAsset = p.imagePath.startsWith('assets/');
+            final ImageProvider bg2 = isAsset ? AssetImage(p.imagePath) : ResizeImage(FileImage(File(p.imagePath)), width: 64, height: 64);
+            return GestureDetector(
+              onTap: () => Navigator.pop(context, p),
+              child: Container(
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                decoration: BoxDecoration(color: AppColors.coral.withValues(alpha: 0.95), borderRadius: BorderRadius.circular(4)),
+                child: Row(
+                  children: [
+                    CircleAvatar(radius: 16, backgroundImage: bg2, backgroundColor: Colors.white, onBackgroundImageError: (_, _) {}),
+                    const SizedBox(width: 10),
+                    Expanded(child: Text(p.name, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 13))),
+                    const Icon(Icons.chevron_right, color: Colors.white70, size: 18),
+                  ],
+                ),
+              ),
+            );
+          },
         );
       },
     );
